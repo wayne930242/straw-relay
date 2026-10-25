@@ -355,18 +355,25 @@ type Event struct {
 
 // EventsAfter returns the events with eid greater than after that a device may see, oldest first: every roster entry, the queued envelopes
 // addressed to it and not yet acknowledged, the last ephemeral envelope of each sender and kind addressed to it (or to the whole team), and
-// the join requests of its invites. With onlyRoster, only roster entries (what a removed device is still shown).
-func (s *Store) EventsAfter(team []byte, device string, after int64, limit int, onlyRoster bool) ([]Event, error) {
-	q := `SELECT eid, typ, COALESCE(seq, 0), ref, sender, ephemeral, body FROM events e WHERE team = ? AND eid > ? AND (typ = 'roster'`
+// the join requests of its invites. With replayQueued (the first page of a stream), every queued envelope still pending for the device is
+// returned whatever `after` says: a device that resumed past one it never acknowledged (a crash before delivery) must not lose it. With
+// onlyRoster, only roster entries (what a removed device is still shown).
+func (s *Store) EventsAfter(team []byte, device string, after int64, limit int, replayQueued, onlyRoster bool) ([]Event, error) {
+	q := `SELECT eid, typ, COALESCE(seq, 0), ref, sender, ephemeral, body FROM events e WHERE team = ? AND ((eid > ? AND (typ = 'roster'`
 	args := []any{team, after}
 	if !onlyRoster {
 		q += ` OR (typ = 'join' AND instr(addressed, ?) > 0)
-			OR (typ = 'envelope' AND ephemeral = 1 AND sender <> ? AND (addressed = '[]' OR instr(addressed, ?) > 0))
-			OR (typ = 'envelope' AND ephemeral = 0 AND EXISTS (SELECT 1 FROM deliveries d WHERE d.eid = e.eid AND d.device = ?))`
+			OR (typ = 'envelope' AND ephemeral = 1 AND sender <> ? AND (addressed = '[]' OR instr(addressed, ?) > 0))`
 		quoted := `"` + device + `"`
-		args = append(args, quoted, device, quoted, device)
+		args = append(args, quoted, device, quoted)
 	}
-	q += `) ORDER BY eid LIMIT ?`
+	q += `))`
+	if !onlyRoster {
+		q += ` OR (typ = 'envelope' AND ephemeral = 0 AND (eid > ? OR ?) AND EXISTS (SELECT 1 FROM deliveries d WHERE d.eid = e.eid AND d.device = ?))`
+		args = append(args, after, replayQueued, device)
+	}
+	q += `)`
+	q += ` ORDER BY eid LIMIT ?`
 	args = append(args, limit)
 	rows, err := s.db.Query(q, args...)
 	if err != nil {

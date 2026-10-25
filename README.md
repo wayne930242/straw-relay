@@ -87,7 +87,10 @@ and every rule it can check from plaintext holds. A conflict answers with the he
 
 `GET /v1/teams/{team}/events` is `text/event-stream`. Every event has an `id:` that only grows (one counter per relay); `Last-Event-ID` resumes
 after it. Without it the stream starts from the beginning: every roster entry, every queued envelope not yet acknowledged, the last ephemeral
-envelope of each sender and kind, and any waiting join requests. A `: keepalive` comment line goes out every 25 seconds.
+envelope of each sender and kind, and any waiting join requests. With it, roster entries, ephemeral envelopes, and join requests resume after
+that id, but **every queued envelope the device has not acknowledged is sent again on the stream's first page, whatever the id**, so a device
+that crashed before delivering one does not lose it. A client drops the repeats by `seq` and acknowledges after delivery. A `: keepalive`
+comment line goes out every 25 seconds.
 
 | Event | Data | Sent to |
 |---|---|---|
@@ -96,7 +99,8 @@ envelope of each sender and kind, and any waiting join requests. A `: keepalive`
 | `join` | `{"hash": hex32, "request": b64}` | the inviter |
 
 Queued envelopes stay until the device acknowledges them (`POST …/acks`), whether or not it saw them on a stream, and are dropped after
-7 days. A device removed from the team is shown the roster entries it has not seen, its own removal among them, and the stream ends.
+7 days. Each sender posts its queued envelopes one at a time, in `seq` order, retrying one until it is accepted before posting the next; the
+relay keeps arrival order, which is then the sender's order. A device removed from the team is shown the roster entries it has not seen, its own removal among them, and the stream ends.
 A device may hold up to 4 streams; opening a fifth ends the oldest.
 
 ## What the relay checks

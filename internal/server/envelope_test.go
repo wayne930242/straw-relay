@@ -163,14 +163,15 @@ func TestPerSenderOrderAndAcks(t *testing.T) {
 			t.Errorf("envelope %d out of order", i)
 		}
 	}
-	// Without an ack and without Last-Event-ID they come again; with Last-Event-ID they do not.
+	// Without an ack they come again, whether or not the client resumes past them: an envelope the device has not acknowledged is not lost to a
+	// Last-Event-ID (it may have crashed before delivering it).
 	s2 := h.stream(x.bob, x.Team, "")
 	if n := countEnvelopes(s2.drain()); n != 4 {
 		t.Errorf("unacked after reconnect: %d", n)
 	}
 	s3 := h.stream(x.bob, x.Team, lastEventID)
-	if n := countEnvelopes(s3.drain()); n != 0 {
-		t.Errorf("resumed after the last id: %d", n)
+	if n := countEnvelopes(s3.drain()); n != 4 {
+		t.Errorf("unacked after resuming past them: %d", n)
 	}
 	// Ack two: only the other two remain. An ack of an unknown id or of another device's envelope changes nothing.
 	status, out := h.call(x.bob, x.ID, "POST", "/v1/teams/"+x.Hex()+"/acks", map[string]any{"ids": []string{hx(ids[0]), hx(ids[1]), hx(linktest.Filler(16))}})
@@ -180,7 +181,7 @@ func TestPerSenderOrderAndAcks(t *testing.T) {
 	if status, out := h.call(x.dave, x.ID, "POST", "/v1/teams/"+x.Hex()+"/acks", map[string]any{"ids": []string{hx(ids[2])}}); status != 200 || out["acked"] != float64(0) {
 		t.Errorf("another device's ack: %d %v", status, out)
 	}
-	s4 := h.stream(x.bob, x.Team, "")
+	s4 := h.stream(x.bob, x.Team, lastEventID)
 	if n := countEnvelopes(s4.drain()); n != 2 {
 		t.Errorf("after acking two: %d", n)
 	}
@@ -256,8 +257,16 @@ func TestEphemeralKeepsOnlyTheLastPerDeviceAndKind(t *testing.T) {
 	// A presence of another device, and a unit-status (another kind) of dave to bob.
 	send(x.bob, "presence", nil, NOW+5)
 	send(x.dave, "unit-status", []string{x.bob.ID}, NOW+6)
-	if n := countEnvelopes(live.drain()); n != 4 {
-		t.Errorf("live stream saw %d, want alice's three presences and dave's unit-status, not bob's own presence", n)
+	// A stream that wakes late sees only the newest of a burst (the older ones were already replaced), so the count is not fixed: it sees alice's
+	// presence (the last one among them), dave's unit-status, and never bob's own presence.
+	seen := map[string]int{}
+	for _, e := range live.drain() {
+		if e.Name == "envelope" {
+			seen[e.Data["from"].(string)]++
+		}
+	}
+	if seen[x.alice.ID] < 1 || seen[x.alice.ID] > 3 || seen[x.dave.ID] != 1 || seen[x.bob.ID] != 0 {
+		t.Errorf("live stream saw %v, want alice 1 to 3, dave 1, bob 0", seen)
 	}
 	// A device that connects later gets the last of each device and kind, once, and none of its own.
 	late := h.stream(x.bob, x.Team, "")
@@ -411,5 +420,36 @@ func TestSequenceOfEventIDs(t *testing.T) {
 			t.Fatalf("event ids must increase: %q after %d", e.ID, prev)
 		}
 		prev = id
+	}
+}
+
+// Resuming keeps the cursor for everything but queued envelopes still waiting for this device; those always come again until acknowledged,
+// and nothing else repeats.
+func TestResumeReplaysOnlyUnackedQueuedEnvelopes(t *testing.T) {
+	h := newHarness(t)
+	x := h.team3()
+	id := linktest.Filler(16)
+	h.send(x, x.alice, h.envelope(x, linktest.Env{From: x.alice, Kind: "tower", To: []string{x.bob.ID}, Seq: 1, ID: id}))
+	h.send(x, x.alice, h.envelope(x, linktest.Env{From: x.alice, Kind: "presence", TS: NOW + 1}))
+	first := h.stream(x.bob, x.Team, "")
+	var last string
+	for _, e := range first.drain() {
+		last = e.ID
+	}
+	// A roster entry after the cursor is new; the tower envelope before it is repeated; the roster entries and the presence before are not.
+	carol := linktest.NewDevice(3)
+	h.mustPost(x.alice, x.Team, x.Add(x.alice, carol, true))
+	got := h.stream(x.bob, x.Team, last).drain()
+	var names []string
+	for _, e := range got {
+		names = append(names, e.Name)
+	}
+	if len(got) != 2 || got[0].Name != "envelope" || got[0].Data["id"] != hx(id) || got[1].Name != "roster" {
+		t.Errorf("resumed events %v, want the unacked envelope then the new roster entry", names)
+	}
+	h.call(x.bob, x.ID, "POST", "/v1/teams/"+x.Hex()+"/acks", map[string]any{"ids": []string{hx(id)}})
+	got = h.stream(x.bob, x.Team, last).drain()
+	if len(got) != 1 || got[0].Name != "roster" {
+		t.Errorf("after the ack: %v", got)
 	}
 }

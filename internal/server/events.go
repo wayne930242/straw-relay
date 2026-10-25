@@ -142,12 +142,14 @@ func (s *Server) events(c *call) error {
 	defer tick.Stop()
 	ctx := c.r.Context()
 
+	first := true
 	for {
 		member := false
 		if t, err := s.team(team); err == nil && t != nil {
 			_, member = t.current().Members[a.device]
 		}
-		events, err := s.st.EventsAfter(team, a.device, cursor, streamPage, !member)
+		events, err := s.st.EventsAfter(team, a.device, cursor, streamPage, first, !member)
+		first = false
 		if err != nil {
 			return nil
 		}
