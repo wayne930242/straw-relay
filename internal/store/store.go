@@ -93,10 +93,21 @@ func (s *Store) tx(fn func(*sql.Tx) error) error {
 	if err != nil {
 		return err
 	}
+	committed := false
+	// Whatever ends fn short of a commit (an error, a panic, runtime.Goexit) rolls the transaction back, so the write lock is never left held.
+	defer func() {
+		if !committed {
+			_ = t.Rollback()
+		}
+	}()
 	if err := fn(t); err != nil {
-		_ = t.Rollback()
+		committed = true
+		if rbErr := t.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			return errors.Join(err, fmt.Errorf("rollback: %w", rbErr))
+		}
 		return err
 	}
+	committed = true
 	return t.Commit()
 }
 
@@ -284,7 +295,10 @@ func (s *Store) PutEnvelope(team []byte, e Envelope, recipients []string, expire
 		if err != nil {
 			return err
 		}
-		eid, _ := r.LastInsertId()
+		eid, err := r.LastInsertId()
+		if err != nil {
+			return err
+		}
 		if !e.Ephemeral {
 			for _, d := range recipients {
 				if _, err := t.Exec(`INSERT INTO deliveries (eid, device) VALUES (?, ?)`, eid, d); err != nil {
@@ -313,7 +327,11 @@ func (s *Store) Ack(team []byte, device string, ids [][]byte) (int, error) {
 			if err != nil {
 				return err
 			}
-			if n, _ := r.RowsAffected(); n == 0 {
+			n, err := r.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if n == 0 {
 				continue
 			}
 			cleared++
