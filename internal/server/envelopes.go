@@ -81,21 +81,30 @@ func (s *Server) postEnvelope(c *call) error {
 	if h.From != a.device {
 		return fail(http.StatusForbidden, "from-mismatch")
 	}
-	if reason := link.CheckEnvelope(team, a.state, env, s.now()); reason != "" {
+	// Everything that depends on the roster is decided against its state at the moment of the write, under the lock a roster append takes: a
+	// remove that commits after authentication either lands first (and this is refused) or after the envelope is stored (and its cleanup drops it).
+	t := a.entry
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	state := t.state
+	if _, member := state.Members[a.device]; !member {
+		return fail(http.StatusUnauthorized, "not-member")
+	}
+	if reason := link.CheckEnvelope(team, state, env, s.now()); reason != "" {
 		return fail(http.StatusUnprocessableEntity, reason)
 	}
 	// The addressees: the named members, or every member for the whole team; never the sender itself.
 	var recipients []string
 	seen := map[string]bool{a.device: true}
 	if len(h.To) == 0 {
-		for id := range a.state.Members {
+		for id := range state.Members {
 			if !seen[id] {
 				recipients = append(recipients, id)
 			}
 		}
 	} else {
 		for _, id := range h.To {
-			if _, member := a.state.Members[id]; member && !seen[id] {
+			if _, member := state.Members[id]; member && !seen[id] {
 				seen[id] = true
 				recipients = append(recipients, id)
 			}

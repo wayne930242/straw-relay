@@ -86,7 +86,11 @@ func (s *Server) getRoster(c *call) error {
 			return fail(http.StatusBadRequest, "bad-after")
 		}
 	}
+	// Entries and head are read under the lock that appends take, so the head is the last entry returned (or the newest, when none follow).
+	a.entry.mu.Lock()
 	rows, err := s.st.Roster(team, after)
+	head := a.entry.state.Head
+	a.entry.mu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -94,7 +98,7 @@ func (s *Server) getRoster(c *call) error {
 	for _, r := range rows {
 		entries = append(entries, map[string]any{"seq": r.Seq, "hash": hex.EncodeToString(r.Hash), "entry": b64.EncodeToString(r.Entry)})
 	}
-	c.writeJSON(http.StatusOK, map[string]any{"head": headJSON(a.entry.current().Head), "entries": entries})
+	c.writeJSON(http.StatusOK, map[string]any{"head": headJSON(head), "entries": entries})
 	return nil
 }
 
@@ -177,8 +181,15 @@ func (s *Server) postInvite(c *call) error {
 	if err != nil {
 		return err
 	}
+	// The membership check and the write are one step under the team's lock, so a removal that commits first cannot be followed by an invite.
+	a.entry.mu.Lock()
+	defer a.entry.mu.Unlock()
+	m, ok := a.entry.state.Members[a.device]
+	if !ok {
+		return fail(http.StatusUnauthorized, "not-member")
+	}
 	// Only an attended member signs an add, so only one may invite.
-	if !a.state.Members[a.device].Attended {
+	if !m.Attended {
 		return fail(http.StatusForbidden, "not-attended")
 	}
 	now := s.now()

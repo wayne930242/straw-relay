@@ -328,3 +328,5 @@ func (s *stream) closed() bool {
 		return false
 	}
 }
+
+func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }
