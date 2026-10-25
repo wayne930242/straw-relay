@@ -56,7 +56,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 	return fmt.Errorf("unknown command %q", args[0])
 }
 
-func tokenCreate(args []string, stdout, stderr io.Writer) error {
+func tokenCreate(args []string, stdout, stderr io.Writer) (err error) {
 	fs := flag.NewFlagSet("token create", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	db := fs.String("db", env("STRAW_RELAY_DB", "straw-relay.db"), "database file")
@@ -67,12 +67,19 @@ func tokenCreate(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer func() {
+		if cerr := st.Close(); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("closing the database: %w", cerr))
+		}
+	}()
 	token, err := st.CreateToken(time.Now().UnixMilli())
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, token)
+	// A token that could not be printed is not one the operator has.
+	if _, err := fmt.Fprintln(stdout, token); err != nil {
+		return fmt.Errorf("printing the token: %w", err)
+	}
 	return nil
 }
 
@@ -89,7 +96,11 @@ func serve(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer func() {
+		if err := st.Close(); err != nil {
+			log.Error("closing the database failed", "err", err)
+		}
+	}()
 
 	srv := server.New(st, server.Options{Logger: log})
 	httpSrv := server.NewHTTPServer(*addr, srv.Handler(), server.Timeouts{})
