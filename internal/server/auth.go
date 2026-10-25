@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/wayne930242/straw-relay/internal/link"
 )
@@ -24,13 +25,70 @@ func (t *teamEntry) current() *link.State {
 	return t.state
 }
 
-// team returns the cached entry of a team, loading its roster on first use. It is nil for a team that does not exist.
+// A team that does not exist is remembered this long (and at most this many), so a flood of requests for made-up team ids costs one database
+// lookup each, not one per request. Creating the team forgets the miss at once.
+const (
+	missingTTL = 2 * time.Second
+	maxMissing = 1024
+)
+
+// flight is a roster load in progress; requests for the same team wait for it instead of repeating it.
+type flight struct {
+	done chan struct{}
+	t    *teamEntry
+	err  error
+}
+
+// team returns the cached entry of a team, loading its roster on first use. It is nil for a team that does not exist. The load runs outside
+// the lock that guards the cache, once per team at a time, so a slow or cold team never holds up the others.
 func (s *Server) team(id []byte) (*teamEntry, error) {
 	key := string(id)
 	s.teamsMu.Lock()
-	defer s.teamsMu.Unlock()
 	if t, ok := s.teams[key]; ok {
+		s.teamsMu.Unlock()
 		return t, nil
+	}
+	if until, ok := s.missing[key]; ok {
+		if time.Now().Before(until) {
+			s.teamsMu.Unlock()
+			return nil, nil
+		}
+		delete(s.missing, key)
+	}
+	if f, ok := s.flights[key]; ok {
+		s.teamsMu.Unlock()
+		<-f.done
+		return f.t, f.err
+	}
+	f := &flight{done: make(chan struct{})}
+	s.flights[key] = f
+	s.teamsMu.Unlock()
+
+	defer func() {
+		s.teamsMu.Lock()
+		delete(s.flights, key)
+		if cached, ok := s.teams[key]; ok {
+			f.t = cached // created while the load ran
+		} else if f.err == nil {
+			if f.t != nil {
+				s.teams[key] = f.t
+			} else {
+				if len(s.missing) >= maxMissing {
+					s.missing = map[string]time.Time{}
+				}
+				s.missing[key] = time.Now().Add(missingTTL)
+			}
+		}
+		s.teamsMu.Unlock()
+		close(f.done)
+	}()
+	f.t, f.err = s.loadTeam(id)
+	return f.t, f.err
+}
+
+func (s *Server) loadTeam(id []byte) (*teamEntry, error) {
+	if s.hookLoad != nil {
+		s.hookLoad()
 	}
 	rows, err := s.st.Roster(id, -1)
 	if err != nil || len(rows) == 0 {
@@ -45,14 +103,13 @@ func (s *Server) team(id []byte) (*teamEntry, error) {
 		// The stored log was checked entry by entry on the way in; failing here means the database was changed behind the relay's back.
 		return nil, fail(500, "stored-roster-invalid")
 	}
-	t := &teamEntry{state: st}
-	s.teams[key] = t
-	return t, nil
+	return &teamEntry{state: st}, nil
 }
 
 func (s *Server) cacheTeam(id []byte, st *link.State) {
 	s.teamsMu.Lock()
 	s.teams[string(id)] = &teamEntry{state: st}
+	delete(s.missing, string(id))
 	s.teamsMu.Unlock()
 }
 
@@ -122,6 +179,9 @@ func (c *call) authenticate(team, body []byte) (*authed, error) {
 	}
 	if err := c.verify(h, team, m.Record.SignPub, body); err != nil {
 		return nil, err
+	}
+	if c.s.hookAuth != nil {
+		c.s.hookAuth(h.device)
 	}
 	return &authed{device: h.device, team: team, entry: t, state: st}, nil
 }

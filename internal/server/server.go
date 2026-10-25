@@ -74,6 +74,12 @@ type Server struct {
 
 	teamsMu sync.Mutex
 	teams   map[string]*teamEntry
+	flights map[string]*flight
+	missing map[string]time.Time
+
+	// Test hooks (see export_test.go): hookAuth runs right after a request authenticated, hookLoad each time a roster is loaded from the database.
+	hookAuth func(device string)
+	hookLoad func()
 
 	hub     hub
 	limiter limiter
@@ -83,7 +89,7 @@ type Server struct {
 // New makes a Server over a store.
 func New(st *store.Store, o Options) *Server {
 	o.defaults()
-	s := &Server{st: st, opt: o, log: o.Logger, mux: http.NewServeMux(), done: make(chan struct{}), teams: map[string]*teamEntry{}}
+	s := &Server{st: st, opt: o, log: o.Logger, mux: http.NewServeMux(), done: make(chan struct{}), teams: map[string]*teamEntry{}, flights: map[string]*flight{}, missing: map[string]time.Time{}}
 	s.hub.subs = map[string]map[chan struct{}]struct{}{}
 	s.limiter.window = map[string][]int64{}
 	s.streams.byDevice = map[string][]*streamHandle{}
