@@ -116,7 +116,10 @@ func (s *Server) events(c *call) error {
 	}
 	rc := http.NewResponseController(c.w)
 	// The server's ReadTimeout would otherwise cancel the request's context while the stream is still open.
-	_ = rc.SetReadDeadline(time.Time{})
+	if err := rc.SetReadDeadline(time.Time{}); err != nil {
+		s.log.Error("stream refused: cannot clear the read deadline", "team", c.team, "device", a.device, "err", err)
+		return fail(http.StatusInternalServerError, "stream-unsupported")
+	}
 	w := c.w
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -124,13 +127,16 @@ func (s *Server) events(c *call) error {
 	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	write := func(format string, args ...any) error {
-		_ = rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout))
+		if err := rc.SetWriteDeadline(time.Now().Add(streamWriteTimeout)); err != nil {
+			return err
+		}
 		if _, err := fmt.Fprintf(w, format, args...); err != nil {
 			return err
 		}
 		return rc.Flush()
 	}
 	if err := rc.Flush(); err != nil {
+		s.log.Info("stream ended: first flush failed", "team", c.team, "device", a.device, "err", err)
 		return nil
 	}
 
@@ -144,19 +150,18 @@ func (s *Server) events(c *call) error {
 
 	first := true
 	for {
-		member := false
-		if t, err := s.team(team); err == nil && t != nil {
-			_, member = t.current().Members[a.device]
-		}
+		// The team entry authenticate returned is the live one (roster appends update it in place), so no lookup here can fail and make a
+		// member look removed.
+		_, member := a.entry.current().Members[a.device]
 		events, err := s.st.EventsAfter(team, a.device, cursor, streamPage, first, !member)
 		first = false
 		if err != nil {
-			return nil
+			return c.streamFailed("events query failed", a.device, err)
 		}
 		for _, e := range events {
 			data, err := eventData(e)
 			if err != nil {
-				return nil
+				return c.streamFailed("event encoding failed", a.device, err)
 			}
 			if write("id: %d\nevent: %s\ndata: %s\n\n", e.EID, e.Type, data) != nil {
 				return nil
@@ -194,4 +199,12 @@ func eventData(e store.Event) ([]byte, error) {
 	default:
 		return json.Marshal(map[string]any{"hash": hex.EncodeToString(e.Ref), "request": b64.EncodeToString(e.Body)})
 	}
+}
+
+// streamFailed logs why a stream ended on a server-side fault, with the team and device, and records the reason for the request's log line. The
+// client sees the connection close and reconnects; it is never told the device was removed.
+func (c *call) streamFailed(msg, device string, err error) error {
+	c.s.log.Error(msg, "team", c.team, "device", device, "err", err)
+	c.reason = "store-error"
+	return nil
 }
