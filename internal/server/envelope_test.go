@@ -316,7 +316,7 @@ func TestCaps(t *testing.T) {
 			t.Fatalf("200 KB: %d %v", status, out)
 		}
 		big := h.envelope(x, linktest.Env{From: x.alice, Kind: "tower", To: []string{x.bob.ID}, Seq: 2, CT: linktest.Filler(256 * 1024)})
-		if status, out := h.send(x, x.alice, big); status != 429 || out["error"] != "envelope-too-large" {
+		if status, out := h.send(x, x.alice, big); status != 413 || out["error"] != "envelope-too-large" {
 			t.Errorf("over 256 KB: %d %v", status, out)
 		}
 	})

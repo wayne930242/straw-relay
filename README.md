@@ -67,7 +67,7 @@ the body, and `POST /v1/teams` is checked against the founder's key in the `crea
 harmless: envelopes dedupe by id, a roster append is compare and set, and the other writes are idempotent or refused as duplicates.
 
 **Errors** are `{"error": "<code>"}` with these statuses: 400 malformed input, 401 authentication, 403 not allowed, 404 no such invite,
-409 conflict, 413 body over the hard limit, 422 a roster entry or envelope the rules refuse (the code is the rule's reason), 429 a cap.
+409 conflict, 413 a body or envelope over its size limit (permanent: retrying cannot help), 422 a roster entry or envelope the rules refuse (the code is the rule's reason), 429 a cap that clears (team storage, rate, open invites).
 A 429 carries `Retry-After`.
 
 | Endpoint | Request body | Success | Other answers |
@@ -75,7 +75,7 @@ A 429 carries `Retry-After`.
 | `POST /v1/teams` | `{"team": hex16, "token": "srt1_…", "entry": b64}` | 201 `{"team", "head": {"seq": 0, "hash"}}` | 401 `bad-token`; 409 `team-exists`; 422 the create entry's reason |
 | `GET …/roster` | none | 200 `{"head": {"seq", "hash"}, "entries": [{"seq", "hash", "entry": b64}]}` | 400 `bad-after` |
 | `POST …/roster` | `{"entry": b64}` | 201 `{"seq", "hash"}` | 403 `not-signer`; 409 `conflict` with `"head": {"seq", "hash"}`; 422 reason with `"seq"` |
-| `POST …/envelopes` | `{"envelope": b64}` | 201 `{"id": hex16, "duplicate": false}`; 200 with `"duplicate": true` for an id already stored, or `"stale": true` for an ephemeral envelope no newer than the kept one | 400 `malformed`; 403 `from-mismatch`; 422 header reason or `no-addressee`; 429 `rate-limited`, `envelope-too-large`, `team-full` |
+| `POST …/envelopes` | `{"envelope": b64}` | 201 `{"id": hex16, "duplicate": false}`; 200 with `"duplicate": true` for an id already stored, or `"stale": true` for an ephemeral envelope no newer than the kept one | 400 `malformed`; 403 `from-mismatch`; 413 `envelope-too-large` (over 256 KB); 422 header reason or `no-addressee`; 429 `rate-limited`, `team-full` |
 | `POST …/acks` | `{"ids": [hex16, …]}` (at most 500) | 200 `{"acked": n}` | 400 |
 | `POST /v1/invites` | `{"team": hex16, "h": hex32, "expires": ms}` | 201 `{"expires"}` | 403 `not-attended`; 409 `invite-exists`; 422 `bad-expiry`; 429 `too-many-invites` |
 | `POST /v1/invites/{h}/join` | `{"request": b64}` (at most 4096 bytes decoded) | 202 `{"queued": true}` | 404 `no-invite` (unknown or expired); 409 `invite-used`; 413 |
@@ -114,7 +114,7 @@ A device may hold up to 4 streams; opening a fifth ends the oldest.
   and signed it, the kind is one that sender's `attended` flag allows, the epoch (current, or the previous one when the sender's roster head
   predates the rotation), whole-team only for kinds that allow it, `seq` is 0 for ephemeral kinds and at least 1 for queued ones, the
   roster head exists, `ts` is at most 10 minutes ahead and at most 7 days back. The envelope's `from` has to be the caller.
-- **Caps per team**: 50 MB stored, 256 KB per envelope, 600 envelopes a minute; over a cap the answer is 429. Open invites: 50 per team.
+- **Caps per team**: 50 MB stored, 256 KB per envelope, 600 envelopes a minute; over the storage or rate cap the answer is 429, over the envelope size 413. Open invites: 50 per team.
 
 What a receiver decides from its own state stays with the receivers: whether an envelope is addressed to it, the `seq` and `ts` guards, the
 team key and the ciphertext, sealed keys and label tables in roster entries.

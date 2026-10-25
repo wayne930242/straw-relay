@@ -71,7 +71,7 @@ func (s *Server) postEnvelope(c *call) error {
 		return err
 	}
 	if len(envRaw) > s.opt.MaxEnvelope {
-		return fail(http.StatusTooManyRequests, "envelope-too-large")
+		return fail(http.StatusRequestEntityTooLarge, "envelope-too-large")
 	}
 	env, derr := link.DecodeEnvelope(envRaw)
 	if derr != nil {
