@@ -27,10 +27,7 @@ func TestTeamCreationNeedsAOneTimeToken(t *testing.T) {
 	if status, out := h.call(founder, tm.ID, "POST", "/v1/teams", body("srt1_not-a-token")); status != 401 || out["error"] != "bad-token" {
 		t.Errorf("wrong token: %d %v", status, out)
 	}
-	tok, err := h.st.CreateToken(h.now.Load())
-	if err != nil {
-		t.Fatal(err)
-	}
+	tok := h.token()
 	// An invalid create entry (an unattended founder) does not burn the token.
 	bad := linktest.Entry(tm.ID, founder, linktest.EntryParams{Seq: 0, Prev: make([]byte, 32), Op: "create", Subject: &linktest.Subj{Dev: founder, Role: "admin", Attended: false}, Epoch: 1, Payload: linktest.Filler(60)})
 	if status, out := h.call(founder, tm.ID, "POST", "/v1/teams", map[string]any{"team": tm.Hex(), "token": tok, "entry": b64(bad)}); status != 422 || out["error"] != "bad-founder" {
@@ -53,7 +50,7 @@ func TestTeamCreationNeedsAOneTimeToken(t *testing.T) {
 		t.Errorf("reused token: %d %v", status, out)
 	}
 	// The same team again with a fresh token is a conflict, and that token survives it.
-	tok2, _ := h.st.CreateToken(h.now.Load())
+	tok2 := h.token()
 	if status, out := h.call(founder, tm.ID, "POST", "/v1/teams", body(tok2)); status != 409 || out["error"] != "team-exists" {
 		t.Errorf("same team: %d %v", status, out)
 	}
@@ -277,7 +274,7 @@ func TestVectorRosterThroughTheEndpoint(t *testing.T) {
 	}
 	team, _ := hex.DecodeString(v.Team)
 	h := newHarness(t)
-	tok, _ := h.st.CreateToken(h.now.Load())
+	tok := h.token()
 	for i, entryHex := range v.Roster.Log {
 		entry, _ := hex.DecodeString(entryHex)
 		fields, _ := canon.Dec(entry, 8)

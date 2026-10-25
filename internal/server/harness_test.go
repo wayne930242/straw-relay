@@ -118,9 +118,16 @@ func (h *harness) callRaw(dev *linktest.Device, team []byte, method, path string
 		h.t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.t.Fatalf("reading the response: %v", err)
+	}
 	var out map[string]any
-	_ = json.Unmarshal(data, &out)
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &out); err != nil {
+			h.t.Fatalf("response is not a JSON object: %v: %q", err, data)
+		}
+	}
 	return resp.StatusCode, out
 }
 
@@ -128,10 +135,7 @@ func (h *harness) callRaw(dev *linktest.Device, team []byte, method, path string
 func (h *harness) newTeam(founder *linktest.Device) *linktest.Team {
 	h.t.Helper()
 	tm := linktest.NewTeam()
-	tok, err := h.st.CreateToken(h.now.Load())
-	if err != nil {
-		h.t.Fatal(err)
-	}
+	tok := h.token()
 	entry := tm.Create(founder)
 	status, out := h.call(founder, tm.ID, "POST", "/v1/teams", map[string]any{"team": tm.Hex(), "token": tok, "entry": b64(entry)})
 	if status != 201 {
@@ -233,7 +237,9 @@ func (h *harness) stream(dev *linktest.Device, tm *linktest.Team, lastID string)
 			switch {
 			case line == "":
 				if cur.Name != "" {
-					_ = json.Unmarshal([]byte(strings.Join(data, "\n")), &cur.Data)
+					if err := json.Unmarshal([]byte(strings.Join(data, "\n")), &cur.Data); err != nil {
+						s.t.Errorf("event data is not JSON: %v", err)
+					}
 					s.events <- cur
 				}
 				cur, data = event{}, nil
@@ -330,3 +336,30 @@ func (s *stream) closed() bool {
 }
 
 func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }
+
+func (h *harness) token() string {
+	h.t.Helper()
+	tok, err := h.st.CreateToken(h.now.Load())
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return tok
+}
+
+func (h *harness) pending(team []byte, device string) int {
+	h.t.Helper()
+	n, err := h.st.PendingFor(team, device)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return n
+}
+
+func (h *harness) stored(team []byte) int64 {
+	h.t.Helper()
+	n, err := h.st.StoredBytes(team)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return n
+}

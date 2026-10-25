@@ -71,10 +71,10 @@ func TestRemovalDuringAnEnvelopePostLeavesNothingBehind(t *testing.T) {
 	if r.status != 401 {
 		t.Errorf("the removed sender's envelope: %d %v, want 401", r.status, r.out)
 	}
-	if n, _ := h.st.PendingFor(x.ID, x.dave.ID); n != 0 {
+	if n := h.pending(x.ID, x.dave.ID); n != 0 {
 		t.Errorf("dave has %d envelopes from a device removed before they were stored", n)
 	}
-	if n, _ := h.st.StoredBytes(x.ID); n != 0 {
+	if n := h.stored(x.ID); n != 0 {
 		t.Errorf("%d bytes stored for a removed sender", n)
 	}
 }
@@ -191,10 +191,10 @@ func TestRemovalDropsQueuedMailBothWays(t *testing.T) {
 		}
 	}
 	h.mustPost(x.alice, x.Team, x.Remove(x.alice, x.bob))
-	if n, _ := h.st.PendingFor(x.ID, x.bob.ID); n != 0 {
+	if n := h.pending(x.ID, x.bob.ID); n != 0 {
 		t.Errorf("bob still has %d queued envelopes", n)
 	}
-	if n, _ := h.st.PendingFor(x.ID, x.dave.ID); n != 0 {
+	if n := h.pending(x.ID, x.dave.ID); n != 0 {
 		t.Errorf("dave still has %d envelopes bob sent", n)
 	}
 	var ids []any
@@ -264,7 +264,7 @@ func TestRosterLoadsAreSingleFlightAndNegativelyCached(t *testing.T) {
 		t.Errorf("an unknown team was looked up %d times in 10 requests, want 1", n)
 	}
 	// Creating the team makes it visible at once: the negative answer does not outlive it.
-	tok, _ := h.st.CreateToken(h.now.Load())
+	tok := h.token()
 	late := linktest.NewDevice(7)
 	entry := ghost.Create(late)
 	body := []byte(`{"team":"` + ghost.Hex() + `","token":"` + tok + `","entry":"` + b64(entry) + `"}`)

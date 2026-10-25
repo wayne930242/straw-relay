@@ -232,7 +232,7 @@ func TestEnvelopeKeptSevenDaysOrUntilAllAck(t *testing.T) {
 	if n := countEnvelopes(h.stream(x.dave, x.Team, "").drain()); n != 0 {
 		t.Errorf("kept past seven days: %d", n)
 	}
-	if n, _ := h.st.StoredBytes(x.ID); n != 0 {
+	if n := h.stored(x.ID); n != 0 {
 		t.Errorf("stored after expiry: %d", n)
 	}
 }

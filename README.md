@@ -34,7 +34,7 @@ write), 120 s idle on a kept-alive connection, 16 KB of headers.
 ## Endpoints
 
 | Endpoint | What it does |
-|---|---|
+| --- | --- |
 | `POST /v1/teams` | Create a team from its `create` entry and an operator token. |
 | `GET /v1/teams/{team}/roster?after=seq` | Entries with seq greater than `after` (all when absent), and the head. |
 | `POST /v1/teams/{team}/roster` | Append an entry by compare and set on `prev`. |
@@ -56,7 +56,7 @@ padding. Device ids are the 26-character base32 of the spec.
 **Authentication.** Every request except a join carries
 
 | Header | Value |
-|---|---|
+| --- | --- |
 | `X-Straw-Device` | the caller's device id |
 | `X-Straw-Time` | milliseconds since the epoch, decimal |
 | `X-Straw-Sig` | hex Ed25519 signature over `"straw-link/request/1" ‖ team ‖ canonical(method, request target, time, sha256(body))` |
@@ -71,7 +71,7 @@ harmless: envelopes dedupe by id, a roster append is compare and set, and the ot
 A 429 carries `Retry-After`.
 
 | Endpoint | Request body | Success | Other answers |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `POST /v1/teams` | `{"team": hex16, "token": "srt1_…", "entry": b64}` | 201 `{"team", "head": {"seq": 0, "hash"}}` | 401 `bad-token`; 409 `team-exists`; 422 the create entry's reason |
 | `GET …/roster` | none | 200 `{"head": {"seq", "hash"}, "entries": [{"seq", "hash", "entry": b64}]}` | 400 `bad-after` |
 | `POST …/roster` | `{"entry": b64}` | 201 `{"seq", "hash"}` | 403 `not-signer`; 409 `conflict` with `"head": {"seq", "hash"}`; 422 reason with `"seq"` |
@@ -93,7 +93,7 @@ that crashed before delivering one does not lose it. A client drops the repeats 
 comment line goes out every 25 seconds.
 
 | Event | Data | Sent to |
-|---|---|---|
+| --- | --- | --- |
 | `roster` | `{"seq", "hash", "entry": b64}` | every member |
 | `envelope` | `{"id": hex16, "from": deviceId, "ephemeral": bool, "envelope": b64}` | the addressees; for an ephemeral envelope addressed to the whole team, every member but the sender |
 | `join` | `{"hash": hex32, "request": b64}` | the inviter |

@@ -80,7 +80,7 @@ func TestRemovedDeviceSeesItsRemovalThenTheStreamEnds(t *testing.T) {
 		t.Error("the removed device's stream must end")
 	}
 	// What was queued for it is dropped; its presence is gone.
-	if n, _ := h.st.PendingFor(x.ID, x.bob.ID); n != 0 {
+	if n := h.pending(x.ID, x.bob.ID); n != 0 {
 		t.Errorf("pending for a removed device: %d", n)
 	}
 }
