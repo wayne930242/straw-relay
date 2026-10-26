@@ -26,4 +26,6 @@ var Kinds = map[string]KindRule{
 	"dialog-close":    {false, false, SenderUnattended},
 	"unit-status":     {true, false, SenderUnattended},
 	"notice":          {false, false, SenderUnattended},
+	"caps":            {true, true, SenderAny},
+	"tower-reply":     {false, false, SenderAny},
 }
