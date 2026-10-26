@@ -64,7 +64,13 @@ type harness struct {
 
 func newHarness(t *testing.T, mod ...func(*server.Options)) *harness {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "relay.db"))
+	return newHarnessAt(t, filepath.Join(t.TempDir(), "relay.db"), mod...)
+}
+
+// newHarnessAt serves the database at path, which may already hold a team.
+func newHarnessAt(t *testing.T, path string, mod ...func(*server.Options)) *harness {
+	t.Helper()
+	st, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
