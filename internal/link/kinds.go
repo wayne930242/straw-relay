@@ -18,6 +18,7 @@ type KindRule struct {
 var Kinds = map[string]KindRule{
 	"tower":           {false, false, SenderAny},
 	"presence":        {true, true, SenderAny},
+	"board":           {true, true, SenderAny},
 	"confirm-request": {false, false, SenderAny},
 	"confirm-answer":  {false, false, SenderAny},
 	"dialog-open":     {false, false, SenderUnattended},

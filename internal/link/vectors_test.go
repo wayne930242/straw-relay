@@ -35,6 +35,11 @@ type vectors struct {
 		Count *int    `json:"count"`
 		Read  *string `json:"read"`
 	} `json:"canonInvalid"`
+	BoardCases []struct {
+		Name      string          `json:"name"`
+		Plaintext string          `json:"plaintext"`
+		Expect    json.RawMessage `json:"expect"`
+	} `json:"boardCases"`
 	Base32  []struct{ Hex, Text string } `json:"base32"`
 	Devices map[string]struct {
 		SignSeed      string `json:"signSeed"`
@@ -403,6 +408,55 @@ func TestEnvelopeShapeVectors(t *testing.T) {
 	for _, bad := range [][]byte{nil, raw[:len(raw)-1], append(append([]byte{}, raw...), 0), raw[:10]} {
 		if _, err := DecodeEnvelope(bad); err == nil {
 			t.Error("a damaged envelope decoded")
+		}
+	}
+}
+
+// boardStructure reads a board plaintext the way a client does, without the caps (the relay never sees plaintext, so this only proves that the
+// shared vectors are structures the canonical decoder reads, or refuses): entries of 7 fields, items of 2.
+func boardStructure(b []byte) error {
+	top, err := canon.Dec(b, 1)
+	if err != nil {
+		return err
+	}
+	entries, err := canon.ReadList(top[0])
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		f, err := canon.Dec(e, 7)
+		if err != nil {
+			return err
+		}
+		if _, err := canon.ReadInt(f[5]); err != nil {
+			return err
+		}
+		items, err := canon.ReadList(f[6])
+		if err != nil {
+			return err
+		}
+		for _, i := range items {
+			g, err := canon.Dec(i, 2)
+			if err != nil {
+				return err
+			}
+			if _, err := canon.ReadBool(g[1]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func TestBoardPlaintextVectors(t *testing.T) {
+	v := loadVectors(t)
+	if len(v.BoardCases) < 9 {
+		t.Fatalf("only %d board cases", len(v.BoardCases))
+	}
+	for _, c := range v.BoardCases {
+		refused := string(c.Expect) == "null"
+		if err := boardStructure(unhex(t, c.Plaintext)); (err != nil) != refused {
+			t.Errorf("%s: structure error %v, refused %v", c.Name, err, refused)
 		}
 	}
 }
