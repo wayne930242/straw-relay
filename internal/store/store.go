@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 
@@ -68,12 +69,26 @@ CREATE INDEX IF NOT EXISTS invites_team ON invites (team);
 type Store struct{ db *sql.DB }
 
 // Open opens (and creates) the database at path. Writes take the lock up front, so concurrent writers wait instead of failing.
-func Open(path string) (*Store, error) {
+func Open(path string) (*Store, error) { return openDB(path, "") }
+
+// OpenExisting is Open for the maintenance commands: the file must already exist (mode=rw), so a mistyped path fails instead of becoming an empty database
+// that a backup would then happily snapshot.
+func OpenExisting(path string) (*Store, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	return openDB(path, "rw")
+}
+
+func openDB(path, mode string) (*Store, error) {
 	q := url.Values{}
 	for _, p := range []string{"busy_timeout(5000)", "journal_mode(WAL)", "synchronous(NORMAL)", "foreign_keys(1)"} {
 		q.Add("_pragma", p)
 	}
 	q.Set("_txlock", "immediate")
+	if mode != "" {
+		q.Set("mode", mode)
+	}
 	db, err := sql.Open("sqlite", "file:"+path+"?"+q.Encode())
 	if err != nil {
 		return nil, err
@@ -90,38 +105,73 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 // Backup writes a consistent snapshot of the database to path with VACUUM INTO, which is safe while the relay serves (WAL mode makes a plain file copy
-// unsafe). The snapshot is one self-contained file; path must not exist.
+// unsafe). The snapshot is one self-contained file; path must not exist. It is written to path+".tmp" and renamed, so a process killed mid-way leaves
+// a ".tmp" file that no "*.db" glob picks up, never a partial snapshot under the final name. A ".tmp" left by an earlier run is replaced.
 func (s *Store) Backup(path string) error {
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("%s already exists", path)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if _, err := s.db.Exec(`VACUUM INTO ?`, path); err != nil {
-		_ = os.Remove(path)
+	tmp := path + ".tmp"
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := s.db.Exec(`VACUUM INTO ?`, tmp); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("backup: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("backup: %w", err)
 	}
 	return nil
 }
 
-// RaiseEventSequence makes the next event id at least min. A restored snapshot rolls the AUTOINCREMENT counter back, and a client that holds a higher
-// Last-Event-ID would then never see the new events; raising the counter above every id a client may hold fixes that. It never lowers the counter.
-func (s *Store) RaiseEventSequence(min int64) error {
-	return s.tx(func(tx *sql.Tx) error {
+// RaiseEventSequence makes the next event id at least min and returns the counter's value afterwards (the next event id is that plus one). A restored
+// snapshot rolls the AUTOINCREMENT counter back, and a client that holds a higher Last-Event-ID would then never see the new events; raising the counter
+// above every id a client may hold fixes that. It never lowers the counter.
+func (s *Store) RaiseEventSequence(min int64) (int64, error) {
+	return s.raiseEventSequence(func(cur int64) (int64, error) { return max(cur, min), nil })
+}
+
+// RaiseEventSequenceBy adds by to the event counter and returns the new value. Unlike RaiseEventSequence with a fixed target it always moves the counter,
+// so a second restore (whose snapshot already carries a counter raised by the first) is raised again.
+func (s *Store) RaiseEventSequenceBy(by int64) (int64, error) {
+	if by < 1 {
+		return 0, fmt.Errorf("the increase must be at least 1, got %d", by)
+	}
+	return s.raiseEventSequence(func(cur int64) (int64, error) {
+		if cur > math.MaxInt64-by {
+			return 0, fmt.Errorf("event sequence %d plus %d overflows", cur, by)
+		}
+		return cur + by, nil
+	})
+}
+
+func (s *Store) raiseEventSequence(target func(cur int64) (int64, error)) (int64, error) {
+	var result int64
+	err := s.tx(func(tx *sql.Tx) error {
 		var cur int64
 		err := tx.QueryRow(`SELECT seq FROM sqlite_sequence WHERE name = 'events'`).Scan(&cur)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			_, err = tx.Exec(`INSERT INTO sqlite_sequence (name, seq) VALUES ('events', ?)`, min)
+		missing := errors.Is(err, sql.ErrNoRows)
+		if err != nil && !missing {
 			return err
-		case err != nil:
-			return err
-		case cur >= min:
-			return nil
 		}
-		_, err = tx.Exec(`UPDATE sqlite_sequence SET seq = ? WHERE name = 'events'`, min)
+		next, err := target(cur)
+		if err != nil {
+			return err
+		}
+		result = next
+		switch {
+		case missing:
+			_, err = tx.Exec(`INSERT INTO sqlite_sequence (name, seq) VALUES ('events', ?)`, next)
+		case next != cur:
+			_, err = tx.Exec(`UPDATE sqlite_sequence SET seq = ? WHERE name = 'events'`, next)
+		}
 		return err
 	})
+	return result, err
 }
 
 func (s *Store) tx(fn func(*sql.Tx) error) error {

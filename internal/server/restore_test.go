@@ -46,7 +46,7 @@ func TestRestoredSnapshotNeedsTheEventSequenceRaised(t *testing.T) {
 
 	// Restored and raised above bob's id before serving: the same roster entry reaches him.
 	r := newHarnessAt(t, raised)
-	if err := r.st.RaiseEventSequence(savedID + 1000); err != nil {
+	if _, err := r.st.RaiseEventSequence(savedID + 1000); err != nil {
 		t.Fatal(err)
 	}
 	r.mustPost(x.alice, x.Team, carol)
