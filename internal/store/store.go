@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 
 	_ "modernc.org/sqlite"
 )
@@ -87,6 +88,41 @@ func Open(path string) (*Store, error) {
 
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
+
+// Backup writes a consistent snapshot of the database to path with VACUUM INTO, which is safe while the relay serves (WAL mode makes a plain file copy
+// unsafe). The snapshot is one self-contained file; path must not exist.
+func (s *Store) Backup(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("%s already exists", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := s.db.Exec(`VACUUM INTO ?`, path); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("backup: %w", err)
+	}
+	return nil
+}
+
+// RaiseEventSequence makes the next event id at least min. A restored snapshot rolls the AUTOINCREMENT counter back, and a client that holds a higher
+// Last-Event-ID would then never see the new events; raising the counter above every id a client may hold fixes that. It never lowers the counter.
+func (s *Store) RaiseEventSequence(min int64) error {
+	return s.tx(func(tx *sql.Tx) error {
+		var cur int64
+		err := tx.QueryRow(`SELECT seq FROM sqlite_sequence WHERE name = 'events'`).Scan(&cur)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			_, err = tx.Exec(`INSERT INTO sqlite_sequence (name, seq) VALUES ('events', ?)`, min)
+			return err
+		case err != nil:
+			return err
+		case cur >= min:
+			return nil
+		}
+		_, err = tx.Exec(`UPDATE sqlite_sequence SET seq = ? WHERE name = 'events'`, min)
+		return err
+	})
+}
 
 func (s *Store) tx(fn func(*sql.Tx) error) error {
 	t, err := s.db.Begin()

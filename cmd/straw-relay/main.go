@@ -2,6 +2,8 @@
 //
 //	straw-relay serve [--addr :8080] [--db straw-relay.db]
 //	straw-relay token create [--db straw-relay.db]
+//	straw-relay backup [--db straw-relay.db] <out.db>
+//	straw-relay raise-sequence [--db straw-relay.db] <min-event-id>
 package main
 
 import (
@@ -14,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -24,6 +27,8 @@ import (
 const usage = `usage:
   straw-relay serve [--addr :8080] [--db straw-relay.db]
   straw-relay token create [--db straw-relay.db]
+  straw-relay backup [--db straw-relay.db] <out.db>        consistent snapshot (VACUUM INTO); safe while serving
+  straw-relay raise-sequence [--db straw-relay.db] <min>   after a restore: next event id becomes at least <min>
 
 Environment: STRAW_RELAY_ADDR and STRAW_RELAY_DB set the defaults of --addr and --db.`
 
@@ -51,6 +56,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return serve(args[1:], stderr)
 	case args[0] == "token" && len(args) > 1 && args[1] == "create":
 		return tokenCreate(args[2:], stdout, stderr)
+	case args[0] == "backup":
+		return backup(args[1:], stdout, stderr)
+	case args[0] == "raise-sequence":
+		return raiseSequence(args[1:], stdout, stderr)
 	}
 	fmt.Fprintln(stderr, usage)
 	return fmt.Errorf("unknown command %q", args[0])
@@ -81,6 +90,59 @@ func tokenCreate(args []string, stdout, stderr io.Writer) (err error) {
 		return fmt.Errorf("printing the token: %w", err)
 	}
 	return nil
+}
+
+// openWith parses the flags shared by the maintenance commands, opens the database and returns the positional arguments.
+func openWith(name string, args []string, stderr io.Writer, nargs int) (*store.Store, []string, error) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	db := fs.String("db", env("STRAW_RELAY_DB", "straw-relay.db"), "database file")
+	if err := fs.Parse(args); err != nil {
+		return nil, nil, err
+	}
+	if fs.NArg() != nargs {
+		return nil, nil, fmt.Errorf("%s takes %d argument(s), got %d", name, nargs, fs.NArg())
+	}
+	st, err := store.Open(*db)
+	return st, fs.Args(), err
+}
+
+func backup(args []string, stdout, stderr io.Writer) (err error) {
+	st, rest, err := openWith("backup", args, stderr, 1)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := st.Close(); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("closing the database: %w", cerr))
+		}
+	}()
+	if err := st.Backup(rest[0]); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, "backup written:", rest[0])
+	return err
+}
+
+func raiseSequence(args []string, stdout, stderr io.Writer) (err error) {
+	st, rest, err := openWith("raise-sequence", args, stderr, 1)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := st.Close(); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("closing the database: %w", cerr))
+		}
+	}()
+	min, perr := strconv.ParseInt(rest[0], 10, 64)
+	if perr != nil || min < 0 {
+		return fmt.Errorf("invalid event id %q", rest[0])
+	}
+	if err := st.RaiseEventSequence(min); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, "next event id is at least", min+1)
+	return err
 }
 
 func serve(args []string, stderr io.Writer) error {

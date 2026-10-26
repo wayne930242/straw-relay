@@ -29,3 +29,32 @@ func TestTokenCreateFailsWhenPrintingFails(t *testing.T) {
 		t.Errorf("got %v, want the write error", err)
 	}
 }
+
+func TestBackupAndRaiseSequenceCommands(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "t.db")
+	out := filepath.Join(dir, "snap.db")
+	var stdout strings.Builder
+	if err := run([]string{"backup", "--db", db, out}, &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), out) {
+		t.Errorf("output %q", stdout.String())
+	}
+	if err := run([]string{"backup", "--db", db, out}, io.Discard, io.Discard); err == nil {
+		t.Error("an existing output file must fail")
+	}
+	if err := run([]string{"backup", "--db", db}, io.Discard, io.Discard); err == nil {
+		t.Error("a missing output path must fail")
+	}
+	stdout.Reset()
+	if err := run([]string{"raise-sequence", "--db", out, "1000"}, &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "1001") {
+		t.Errorf("output %q", stdout.String())
+	}
+	if err := run([]string{"raise-sequence", "--db", out, "x"}, io.Discard, io.Discard); err == nil {
+		t.Error("a non-number must fail")
+	}
+}
