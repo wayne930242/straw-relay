@@ -3,7 +3,7 @@
 //	straw-relay serve [--addr :8080] [--db straw-relay.db]
 //	straw-relay token create [--db straw-relay.db]
 //	straw-relay backup [--db straw-relay.db] <out.db | out-dir>
-//	straw-relay raise-sequence [--db straw-relay.db] <min-event-id>
+//	straw-relay raise-sequence [--db straw-relay.db] (--by <n> | <min-event-id>)
 package main
 
 import (
@@ -29,7 +29,9 @@ const usage = `usage:
   straw-relay serve [--addr :8080] [--db straw-relay.db]
   straw-relay token create [--db straw-relay.db]
   straw-relay backup [--db straw-relay.db] <out.db|dir>  consistent snapshot (VACUUM INTO); safe while serving; a directory gets straw-relay-<UTC time>.db
-  straw-relay raise-sequence [--db straw-relay.db] <min>   after a restore: next event id becomes at least <min>
+  straw-relay raise-sequence [--db straw-relay.db] --by <n>   after a restore: add <n> to the event counter (a second restore is raised again)
+  straw-relay raise-sequence [--db straw-relay.db] <min>      after a restore: the event counter becomes at least <min>
+backup and raise-sequence need the database file to exist; they never create one.
 
 Environment: STRAW_RELAY_ADDR and STRAW_RELAY_DB set the defaults of --addr and --db.`
 
@@ -93,32 +95,34 @@ func tokenCreate(args []string, stdout, stderr io.Writer) (err error) {
 	return nil
 }
 
-// openWith parses the flags shared by the maintenance commands, opens the database and returns the positional arguments.
-func openWith(name string, args []string, stderr io.Writer, nargs int) (*store.Store, []string, error) {
+// maintenanceFlags registers the flags shared by the maintenance commands.
+func maintenanceFlags(name string, stderr io.Writer) (*flag.FlagSet, *string) {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	db := fs.String("db", env("STRAW_RELAY_DB", "straw-relay.db"), "database file")
-	if err := fs.Parse(args); err != nil {
-		return nil, nil, err
+	return fs, fs.String("db", env("STRAW_RELAY_DB", "straw-relay.db"), "database file")
+}
+
+// closeInto joins a failed Close into err.
+func closeInto(err *error, st *store.Store) {
+	if cerr := st.Close(); cerr != nil {
+		*err = errors.Join(*err, fmt.Errorf("closing the database: %w", cerr))
 	}
-	if fs.NArg() != nargs {
-		return nil, nil, fmt.Errorf("%s takes %d argument(s), got %d", name, nargs, fs.NArg())
-	}
-	st, err := store.Open(*db)
-	return st, fs.Args(), err
 }
 
 func backup(args []string, stdout, stderr io.Writer) (err error) {
-	st, rest, err := openWith("backup", args, stderr, 1)
+	fs, db := maintenanceFlags("backup", stderr)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("backup takes 1 argument(s), got %d", fs.NArg())
+	}
+	st, err := store.OpenExisting(*db)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if cerr := st.Close(); cerr != nil {
-			err = errors.Join(err, fmt.Errorf("closing the database: %w", cerr))
-		}
-	}()
-	out := rest[0]
+	defer closeInto(&err, st)
+	out := fs.Arg(0)
 	if fi, serr := os.Stat(out); serr == nil && fi.IsDir() {
 		out = filepath.Join(out, "straw-relay-"+time.Now().UTC().Format("20060102-150405")+".db")
 	}
@@ -130,23 +134,38 @@ func backup(args []string, stdout, stderr io.Writer) (err error) {
 }
 
 func raiseSequence(args []string, stdout, stderr io.Writer) (err error) {
-	st, rest, err := openWith("raise-sequence", args, stderr, 1)
+	fs, db := maintenanceFlags("raise-sequence", stderr)
+	by := fs.Int64("by", 0, "add this many to the event counter instead of taking a target")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	bySet := false
+	fs.Visit(func(f *flag.Flag) { bySet = bySet || f.Name == "by" })
+	if bySet && fs.NArg() != 0 || !bySet && fs.NArg() != 1 {
+		return errors.New("raise-sequence takes either --by <n> or one <min> argument")
+	}
+	var min int64
+	if !bySet {
+		var perr error
+		if min, perr = strconv.ParseInt(fs.Arg(0), 10, 64); perr != nil || min < 0 {
+			return fmt.Errorf("invalid event id %q", fs.Arg(0))
+		}
+	}
+	st, err := store.OpenExisting(*db)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if cerr := st.Close(); cerr != nil {
-			err = errors.Join(err, fmt.Errorf("closing the database: %w", cerr))
-		}
-	}()
-	min, perr := strconv.ParseInt(rest[0], 10, 64)
-	if perr != nil || min < 0 {
-		return fmt.Errorf("invalid event id %q", rest[0])
+	defer closeInto(&err, st)
+	var seq int64
+	if bySet {
+		seq, err = st.RaiseEventSequenceBy(*by)
+	} else {
+		seq, err = st.RaiseEventSequence(min)
 	}
-	if err := st.RaiseEventSequence(min); err != nil {
+	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(stdout, "next event id is at least", min+1)
+	_, err = fmt.Fprintf(stdout, "event counter is now %d; the next event id is %d\n", seq, seq+1)
 	return err
 }
 
