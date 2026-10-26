@@ -58,3 +58,15 @@ func TestBackupAndRaiseSequenceCommands(t *testing.T) {
 		t.Error("a non-number must fail")
 	}
 }
+
+func TestBackupIntoADirectoryNamesTheFileByTime(t *testing.T) {
+	dir := t.TempDir()
+	var stdout strings.Builder
+	if err := run([]string{"backup", "--db", filepath.Join(dir, "t.db"), dir}, &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := filepath.Glob(filepath.Join(dir, "straw-relay-*.db"))
+	if len(m) != 1 || !strings.Contains(stdout.String(), m[0]) {
+		t.Errorf("files %v, output %q", m, stdout.String())
+	}
+}

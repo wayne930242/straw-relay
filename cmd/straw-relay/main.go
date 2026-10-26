@@ -2,7 +2,7 @@
 //
 //	straw-relay serve [--addr :8080] [--db straw-relay.db]
 //	straw-relay token create [--db straw-relay.db]
-//	straw-relay backup [--db straw-relay.db] <out.db>
+//	straw-relay backup [--db straw-relay.db] <out.db | out-dir>
 //	straw-relay raise-sequence [--db straw-relay.db] <min-event-id>
 package main
 
@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -27,7 +28,7 @@ import (
 const usage = `usage:
   straw-relay serve [--addr :8080] [--db straw-relay.db]
   straw-relay token create [--db straw-relay.db]
-  straw-relay backup [--db straw-relay.db] <out.db>        consistent snapshot (VACUUM INTO); safe while serving
+  straw-relay backup [--db straw-relay.db] <out.db|dir>  consistent snapshot (VACUUM INTO); safe while serving; a directory gets straw-relay-<UTC time>.db
   straw-relay raise-sequence [--db straw-relay.db] <min>   after a restore: next event id becomes at least <min>
 
 Environment: STRAW_RELAY_ADDR and STRAW_RELAY_DB set the defaults of --addr and --db.`
@@ -117,10 +118,14 @@ func backup(args []string, stdout, stderr io.Writer) (err error) {
 			err = errors.Join(err, fmt.Errorf("closing the database: %w", cerr))
 		}
 	}()
-	if err := st.Backup(rest[0]); err != nil {
+	out := rest[0]
+	if fi, serr := os.Stat(out); serr == nil && fi.IsDir() {
+		out = filepath.Join(out, "straw-relay-"+time.Now().UTC().Format("20060102-150405")+".db")
+	}
+	if err := st.Backup(out); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(stdout, "backup written:", rest[0])
+	_, err = fmt.Fprintln(stdout, "backup written:", out)
 	return err
 }
 
