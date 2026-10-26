@@ -24,6 +24,8 @@ docker run -d --name straw-relay -p 8080:8080 -v straw-relay-data:/data straw-re
 docker exec straw-relay /straw-relay token create
 ```
 
+A pushed `v*` tag builds and publishes `ghcr.io/wayne930242/straw-relay:<version>` (and `:latest`) through `.github/workflows/image.yml`.
+
 `STRAW_RELAY_ADDR` and `STRAW_RELAY_DB` set the defaults of `--addr` and `--db`. `GET /healthz` answers `{"ok":true}`.
 Logs are JSON lines on stdout: method, route, team id, device id, status, request and response sizes, and the refusal reason. Never a body,
 a token, or a query string.
