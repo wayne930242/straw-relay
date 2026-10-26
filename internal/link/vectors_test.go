@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"regexp"
 	"testing"
 
 	"github.com/wayne930242/straw-relay/internal/canon"
@@ -40,6 +42,17 @@ type vectors struct {
 		Plaintext string          `json:"plaintext"`
 		Expect    json.RawMessage `json:"expect"`
 	} `json:"boardCases"`
+	TowerCases []struct {
+		Name      string          `json:"name"`
+		Plaintext string          `json:"plaintext"`
+		Expect    json.RawMessage `json:"expect"`
+	} `json:"towerCases"`
+	CapsReplyCases []struct {
+		Name      string          `json:"name"`
+		Kind      string          `json:"kind"`
+		Plaintext string          `json:"plaintext"`
+		Expect    json.RawMessage `json:"expect"`
+	} `json:"capsReplyCases"`
 	Base32  []struct{ Hex, Text string } `json:"base32"`
 	Devices map[string]struct {
 		SignSeed      string `json:"signSeed"`
@@ -456,6 +469,64 @@ func TestBoardPlaintextVectors(t *testing.T) {
 	for _, c := range v.BoardCases {
 		refused := string(c.Expect) == "null"
 		if err := boardStructure(unhex(t, c.Plaintext)); (err != nil) != refused {
+			t.Errorf("%s: structure error %v, refused %v", c.Name, err, refused)
+		}
+	}
+}
+
+// towerStructure reads a tower plaintext the way a client does: 4 fields, or 5 with an ask id of 32 lowercase hex digits.
+func towerStructure(b []byte) error {
+	f, err := canon.Dec(b, -1)
+	if err != nil {
+		return err
+	}
+	if len(f) != 4 && len(f) != 5 {
+		return fmt.Errorf("a tower has 4 or 5 fields, got %d", len(f))
+	}
+	if _, err := canon.ReadBool(f[2]); err != nil {
+		return err
+	}
+	if len(f) == 5 && !askID.Match(f[4]) {
+		return fmt.Errorf("not an ask id")
+	}
+	return nil
+}
+
+var askID = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// capsStructure and replyStructure read `caps` (one list of text) and `tower-reply` (two fields) without the caps on length or count.
+func capsStructure(b []byte) error {
+	top, err := canon.Dec(b, 1)
+	if err != nil {
+		return err
+	}
+	_, err = canon.ReadList(top[0])
+	return err
+}
+
+func replyStructure(b []byte) error {
+	_, err := canon.Dec(b, 2)
+	return err
+}
+
+func TestTowerCapsReplyPlaintextVectors(t *testing.T) {
+	v := loadVectors(t)
+	if len(v.TowerCases) < 7 || len(v.CapsReplyCases) < 8 {
+		t.Fatalf("only %d tower and %d caps/tower-reply cases", len(v.TowerCases), len(v.CapsReplyCases))
+	}
+	for _, c := range v.TowerCases {
+		refused := string(c.Expect) == "null"
+		if err := towerStructure(unhex(t, c.Plaintext)); (err != nil) != refused {
+			t.Errorf("%s: structure error %v, refused %v", c.Name, err, refused)
+		}
+	}
+	for _, c := range v.CapsReplyCases {
+		read := map[string]func([]byte) error{"caps": capsStructure, "tower-reply": replyStructure}[c.Kind]
+		if read == nil {
+			t.Fatalf("%s: unexpected kind %s", c.Name, c.Kind)
+		}
+		refused := string(c.Expect) == "null"
+		if err := read(unhex(t, c.Plaintext)); (err != nil) != refused {
 			t.Errorf("%s: structure error %v, refused %v", c.Name, err, refused)
 		}
 	}
