@@ -106,7 +106,8 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // Backup writes a consistent snapshot of the database to path with VACUUM INTO, which is safe while the relay serves (WAL mode makes a plain file copy
 // unsafe). The snapshot is one self-contained file; path must not exist. It is written to path+".tmp" and renamed, so a process killed mid-way leaves
-// a ".tmp" file that no "*.db" glob picks up, never a partial snapshot under the final name. A ".tmp" left by an earlier run is replaced.
+// a ".tmp" file that no "*.db" glob picks up, never a partial snapshot under the final name. Only a ".tmp" of the same name is replaced here; a
+// killed run's differently timed ".tmp" stays until whoever runs the backup deletes it (the deployed upload job removes straw-relay-*.db.tmp older than 1 hour).
 func (s *Store) Backup(path string) error {
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("%s already exists", path)
