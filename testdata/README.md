@@ -1,7 +1,7 @@
 # Test data
 
 `vectors.json` is a copy of `tests/link/vectors.json` from [pi-straw-boss](https://github.com/wayne930242/pi-straw-boss), taken at the
-last commit that changed that file: `bdc569b5a1df8a245e958f946f28ea68ac88f9db`
+last commit that changed that file: `22bea20f1423ac102aaffad363f99290912f0afd`
 ("feat(link): caps and tower-reply kinds, optional awaitsReply field of tower (wire format only)", on pi-straw-boss branch feat/link-kinds-caps-reply).
 
 The tests in `internal/link` replay the parts the relay can decide from plaintext: canonical encoding, device ids, the request signature,
