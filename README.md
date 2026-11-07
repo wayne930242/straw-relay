@@ -89,7 +89,7 @@ and every rule it can check from plaintext holds. A conflict answers with the he
 
 `GET /v1/teams/{team}/events` is `text/event-stream`. Every event has an `id:` that only grows (one counter per relay); `Last-Event-ID` resumes
 after it. Without it the stream starts from the beginning: every roster entry, every queued envelope not yet acknowledged, the last ephemeral
-envelope of each sender and kind, and any waiting join requests. With it, roster entries, ephemeral envelopes, and join requests resume after
+envelope of each sender, kind, and addressee list (one per addressed device, one for the whole team), and any waiting join requests. With it, roster entries, ephemeral envelopes, and join requests resume after
 that id, but **every queued envelope the device has not acknowledged is sent again on the stream's first page, whatever the id**, so a device
 that crashed before delivering one does not lose it. A client drops the repeats by `seq` and acknowledges after delivery. A `: keepalive`
 comment line goes out every 25 seconds.
