@@ -124,8 +124,8 @@ func (s *Server) events(c *call) error {
 		return fail(http.StatusInternalServerError, "stream-unsupported")
 	}
 	// The stream is registered for live envelopes before its headers go out, so one posted after a client sees the stream open is not missed.
-	lq := newLiveQueue(s.opt.LiveQueueEnvelopes, s.opt.LiveQueueBytes)
-	defer s.live.add(c.team, a.device, lq)()
+	lq, leave := s.live.newQueue(c.team, a.device)
+	defer leave()
 	w := c.w
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")

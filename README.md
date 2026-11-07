@@ -109,8 +109,10 @@ comment line goes out every 25 seconds.
 The relay holds the envelope in memory only, writes it to the addressee's streams that are open at that moment, and forgets it: it is never
 written to SQLite, never counted against the 50 MB, never replayed on a new or resumed stream, and never acknowledged. Its `live` event has no
 `id:` line, so `Last-Event-ID` never moves. Each stream has a queue for its writer of 64 envelopes or 4 MB; a full queue drops its oldest, and the
-next envelope the stream writes carries `dropped: n` (the count thrown away before it) as a hint to resync. Envelopes of one sender to one
-addressee keep their arrival order. Removing a member drops what was queued for it and ends its streams, as for the other kinds.
+next envelope the stream writes carries `dropped: n` (the count thrown away before it) as a hint to resync. Queues also share two byte
+budgets, 16 MB for each team and 64 MB for the relay (`Options.LiveTeamBytes`, `LiveRelayBytes`): over either, the oldest envelope of the largest
+queue under that budget is dropped and counted in that stream's `dropped`, so slow readers cannot grow the relay's memory without bound. Envelopes
+of one sender to one addressee keep their arrival order. Removing a member drops what was queued for it and ends its streams, as for the other kinds.
 
 Queued envelopes stay until the device acknowledges them (`POST …/acks`), whether or not it saw them on a stream, and are dropped after
 7 days. Each sender posts its queued envelopes one at a time, in `seq` order, retrying one until it is accepted before posting the next; the
@@ -130,7 +132,7 @@ A device may hold up to 4 streams; opening a fifth ends the oldest.
   roster head exists, `ts` is at most 10 minutes ahead and at most 7 days back. The envelope's `from` has to be the caller.
 - **Live kinds**: the checks above, with exactly one addressee, a member and not the sender (else 422), and no store-based staleness or replacement.
 - **Caps per team**: 50 MB stored, 256 KB per envelope, 600 queued or ephemeral envelopes a minute; over the storage or rate cap the answer is 429, over the envelope size 413. Open invites: 50 per team.
-- **Live limits**, decided after the envelope is decoded and apart from the 600 a minute: 1,200 envelopes and 8 MB a minute for each (team, sender), and 3,000 envelopes a minute for a team; over them the answer is 429 `rate-limited`.
+- **Live limits**, decided after the envelope is decoded and apart from the 600 a minute: 1,200 envelopes and 8 MB a minute for each (team, sender), and 3,000 envelopes a minute for a team; over them the answer is 429 `rate-limited`. Queued live memory is bounded at 64 envelopes or 4 MB for a stream, 16 MB for a team, and 64 MB for the relay, dropping the oldest as above; a negative limit in `Options` stops `server.New` with an error.
 
 What a receiver decides from its own state stays with the receivers: whether an envelope is addressed to it, the `seq` and `ts` guards, the
 team key and the ciphertext, sealed keys and label tables in roster entries.

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -37,10 +38,33 @@ type Options struct {
 	LiveRatePerTeam    int
 	LiveQueueEnvelopes int
 	LiveQueueBytes     int
+	// LiveRelayBytes and LiveTeamBytes cap the live envelopes queued for all streams of the relay (64 MB) and of one team (16 MB). Over either, the
+	// oldest envelope of the largest queue under that cap is dropped (and counted in its stream's `dropped`) until the new one fits.
+	LiveRelayBytes int
+	LiveTeamBytes  int
 	// Retention is how long an unacknowledged envelope is kept (7 days).
 	Retention time.Duration
 	// MaxOpenInvites is the unexpired invites a team may hold (50).
 	MaxOpenInvites int
+}
+
+// validate refuses a limit below zero; zero takes the default.
+func (o *Options) validate() error {
+	for _, l := range []struct {
+		name string
+		v    int64
+	}{
+		{"MaxEnvelope", int64(o.MaxEnvelope)}, {"MaxTeamBytes", o.MaxTeamBytes}, {"RatePerMinute", int64(o.RatePerMinute)}, {"MaxOpenInvites", int64(o.MaxOpenInvites)},
+		{"LiveRatePerSender", int64(o.LiveRatePerSender)}, {"LiveBytesPerSender", o.LiveBytesPerSender}, {"LiveRatePerTeam", int64(o.LiveRatePerTeam)},
+		{"LiveQueueEnvelopes", int64(o.LiveQueueEnvelopes)}, {"LiveQueueBytes", int64(o.LiveQueueBytes)},
+		{"LiveRelayBytes", int64(o.LiveRelayBytes)}, {"LiveTeamBytes", int64(o.LiveTeamBytes)},
+		{"KeepAlive", int64(o.KeepAlive)}, {"Retention", int64(o.Retention)},
+	} {
+		if l.v < 0 {
+			return fmt.Errorf("server option %s is %d: a limit is positive, or zero for its default", l.name, l.v)
+		}
+	}
+	return nil
 }
 
 func (o *Options) defaults() {
@@ -76,6 +100,12 @@ func (o *Options) defaults() {
 	}
 	if o.LiveQueueBytes == 0 {
 		o.LiveQueueBytes = 4 << 20
+	}
+	if o.LiveRelayBytes == 0 {
+		o.LiveRelayBytes = 64 << 20
+	}
+	if o.LiveTeamBytes == 0 {
+		o.LiveTeamBytes = 16 << 20
 	}
 	if o.Retention == 0 {
 		o.Retention = 7 * 24 * time.Hour
@@ -113,7 +143,10 @@ type Server struct {
 }
 
 // New makes a Server over a store.
-func New(st *store.Store, o Options) *Server {
+func New(st *store.Store, o Options) (*Server, error) {
+	if err := o.validate(); err != nil {
+		return nil, err
+	}
 	o.defaults()
 	s := &Server{st: st, opt: o, log: o.Logger, mux: http.NewServeMux(), done: make(chan struct{}), teams: map[string]*teamEntry{}, flights: map[string]*flight{}, missing: map[string]time.Time{}}
 	s.hub.subs = map[string]map[chan struct{}]struct{}{}
@@ -121,6 +154,9 @@ func New(st *store.Store, o Options) *Server {
 	s.liveLimiter.senders = map[string][]liveHit{}
 	s.liveLimiter.teams = map[string][]int64{}
 	s.live.streams = map[string]map[string]map[*liveQueue]struct{}{}
+	s.live.teamBytes = map[string]int{}
+	s.live.relayBudget, s.live.teamBudget = o.LiveRelayBytes, o.LiveTeamBytes
+	s.live.queueItems, s.live.queueBytes = o.LiveQueueEnvelopes, o.LiveQueueBytes
 	s.streams.byDevice = map[string][]*streamHandle{}
 	s.route("GET /healthz", s.healthz)
 	s.route("POST /v1/teams", s.createTeam)
@@ -131,7 +167,7 @@ func New(st *store.Store, o Options) *Server {
 	s.route("POST /v1/teams/{team}/acks", s.postAcks)
 	s.route("POST /v1/invites", s.postInvite)
 	s.route("POST /v1/invites/{h}/join", s.postJoin)
-	return s
+	return s, nil
 }
 
 // Handler is the HTTP handler to serve.

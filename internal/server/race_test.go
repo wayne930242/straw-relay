@@ -210,7 +210,10 @@ func TestRemovalDropsQueuedMailBothWays(t *testing.T) {
 
 func rawServer(t *testing.T, h *harness, hook func()) *httptest.Server {
 	t.Helper()
-	srv := server.New(h.st, server.Options{Now: func() time.Time { return time.UnixMilli(h.now.Load()) }, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), KeepAlive: time.Hour})
+	srv, err := server.New(h.st, server.Options{Now: func() time.Time { return time.UnixMilli(h.now.Load()) }, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), KeepAlive: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv.SetLoadHook(hook)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { srv.Close(); ts.CloseClientConnections(); ts.Close() })

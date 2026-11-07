@@ -13,6 +13,7 @@ import (
 
 	"github.com/wayne930242/straw-relay/internal/linktest"
 	"github.com/wayne930242/straw-relay/internal/server"
+	"github.com/wayne930242/straw-relay/internal/store"
 )
 
 // operateTo is an operate envelope from `from` to the given ids at ts (zero is the harness clock).
@@ -484,4 +485,174 @@ func TestOldKindsStayStored(t *testing.T) {
 	if rowsOf(t, path, "unit-status") != 1 || rowsOf(t, path, "tower") != 1 {
 		t.Error("the stored kinds are not in SQLite")
 	}
+}
+
+// postLive posts an operate envelope of about 1,100 bytes from one device to another.
+func postLive(t *testing.T, h *harness, x *team3, from, to *linktest.Device, i int) string {
+	t.Helper()
+	env := h.envelope(x, linktest.Env{From: from, Kind: "operate", To: []string{to.ID}, TS: NOW + int64(i) + 1, CT: linktest.Filler(1000)})
+	status, out := h.send(x, from, env)
+	if status != 201 || out["delivered"] != float64(1) {
+		t.Fatalf("live post %d: %d %v", i, status, out)
+	}
+	return out["id"].(string)
+}
+
+// Many slow readers cannot grow the queues without bound: over the relay-wide budget the oldest envelope of the largest queue goes, and its stream
+// is told in `dropped`.
+func TestLiveRelayBudgetDropsFromTheLargestQueue(t *testing.T) {
+	const budget = 2800 // two envelopes of about 1,100 bytes fit
+	h := newHarness(t, func(o *server.Options) { o.LiveRelayBytes = budget })
+	gate := gateLive(t, h)
+	a, b := h.team3(), h.team3()
+	bobA, bobB := h.stream(a.bob, a.Team, ""), h.stream(b.bob, b.Team, "")
+	a1 := postLive(t, h, a, a.alice, a.bob, 1)
+	a2 := postLive(t, h, a, a.alice, a.bob, 2)
+	b1 := postLive(t, h, b, b.alice, b.bob, 3)
+	if n := h.srv.LiveQueuedBytes(); n > budget {
+		t.Errorf("%d bytes queued, budget %d", n, budget)
+	}
+	gate()
+	gotA, gotB := nextLive(bobA), nextLive(bobB)
+	if gotA.Data["id"] != a2 || gotA.Data["dropped"] != float64(1) {
+		t.Errorf("team A's queue was the largest, so its oldest (%s) goes: got %v, want %s with dropped 1", a1, gotA.Data, a2)
+	}
+	if gotB.Data["id"] != b1 {
+		t.Errorf("team B's only envelope: %v", gotB.Data)
+	}
+	if _, has := gotB.Data["dropped"]; has {
+		t.Errorf("team B lost nothing: %v", gotB.Data)
+	}
+	if got := liveEvents(bobA.drain()); len(got) != 0 {
+		t.Errorf("team A got %d more live events", len(got))
+	}
+}
+
+// One team's queues share a budget of their own, so a team of slow readers cannot take the relay's whole budget.
+func TestLiveTeamBudgetBoundsAllItsQueues(t *testing.T) {
+	const budget = 2800
+	h := newHarness(t, func(o *server.Options) { o.LiveTeamBytes = budget })
+	gate := gateLive(t, h)
+	x := h.team3()
+	bob, alice := h.stream(x.bob, x.Team, ""), h.stream(x.alice, x.Team, "")
+	postLive(t, h, x, x.alice, x.bob, 1)
+	postLive(t, h, x, x.alice, x.bob, 2)
+	postLive(t, h, x, x.bob, x.alice, 3)
+	postLive(t, h, x, x.bob, x.alice, 4)
+	if n := h.srv.LiveQueuedBytes(); n > budget {
+		t.Errorf("%d bytes queued, budget %d", n, budget)
+	}
+	gate()
+	var got int
+	for _, s := range []*stream{bob, alice} {
+		got += len(liveEvents(s.drain()))
+	}
+	if got != 2 {
+		t.Errorf("%d delivered, want 2: the budget holds two", got)
+	}
+}
+
+// A stream that has closed leaves the registry: its queue takes no more envelopes and a post no longer counts it.
+func TestLiveClosedStreamLeavesTheRegistry(t *testing.T) {
+	h := newHarness(t)
+	x := h.team3()
+	bob := h.stream(x.bob, x.Team, "")
+	bob.drain()
+	if n := h.srv.LiveStreams(); n != 1 {
+		t.Fatalf("%d queues registered for one open stream", n)
+	}
+	bob.body.Close()
+	if !bob.closed() {
+		t.Fatal("the stream did not end")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for h.srv.LiveStreams() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := h.srv.LiveStreams(); n != 0 {
+		t.Errorf("%d queues still registered after the stream closed", n)
+	}
+	env := h.envelope(x, linktest.Env{From: x.alice, Kind: "operate", To: []string{x.bob.ID}, TS: NOW + 1, CT: linktest.Filler(200)})
+	if status, out := h.send(x, x.alice, env); status != 201 || out["delivered"] != float64(0) {
+		t.Errorf("post to a closed stream: %d %v", status, out)
+	}
+	if n := h.srv.LiveQueuedBytes(); n != 0 {
+		t.Errorf("%d bytes queued for no stream", n)
+	}
+}
+
+// Removing a member empties what was queued for it as soon as the removal is accepted, before its stream looks at the queue again.
+func TestRemovalEmptiesTheQueueAtOnce(t *testing.T) {
+	h := newHarness(t)
+	gateLive(t, h)
+	x := h.team3()
+	h.stream(x.bob, x.Team, "")
+	postLive(t, h, x, x.alice, x.bob, 1)
+	if n := h.srv.LiveQueuedBytes(); n == 0 {
+		t.Fatal("nothing queued for bob before the removal")
+	}
+	h.mustPost(x.alice, x.Team, x.Remove(x.alice, x.bob))
+	if n := h.srv.LiveQueuedBytes(); n != 0 {
+		t.Errorf("%d bytes still queued for the removed member", n)
+	}
+}
+
+// The stream checks membership itself before it writes: an envelope that reaches a removed member's queue after the removal (which a post can no longer do)
+// is not written.
+func TestStreamChecksMembershipBeforeWritingLive(t *testing.T) {
+	h := newHarness(t)
+	open := gateLive(t, h)
+	x := h.team3()
+	bob := h.stream(x.bob, x.Team, "")
+	postLive(t, h, x, x.alice, x.bob, 1)
+	h.mustPost(x.alice, x.Team, x.Remove(x.alice, x.bob))
+	h.srv.LiveInject(x.ID, x.bob.ID, []byte("late"))
+	open()
+	var seen []event
+	for {
+		e, ok := bob.next()
+		if !ok {
+			break
+		}
+		if e.Comment == "" {
+			seen = append(seen, e)
+		}
+	}
+	if got := liveEvents(seen); len(got) != 0 {
+		t.Errorf("a removed member's stream wrote %d live events", len(got))
+	}
+}
+
+// A negative limit is a mistake the relay refuses to start with; zero takes the default.
+func TestNewRejectsNegativeLimits(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "relay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	cases := map[string]func(*server.Options){
+		"LiveQueueEnvelopes": func(o *server.Options) { o.LiveQueueEnvelopes = -1 },
+		"LiveQueueBytes":     func(o *server.Options) { o.LiveQueueBytes = -1 },
+		"LiveRelayBytes":     func(o *server.Options) { o.LiveRelayBytes = -1 },
+		"LiveTeamBytes":      func(o *server.Options) { o.LiveTeamBytes = -1 },
+		"LiveRatePerSender":  func(o *server.Options) { o.LiveRatePerSender = -1 },
+		"LiveBytesPerSender": func(o *server.Options) { o.LiveBytesPerSender = -1 },
+		"LiveRatePerTeam":    func(o *server.Options) { o.LiveRatePerTeam = -1 },
+	}
+	for name, set := range cases {
+		o := server.Options{}
+		set(&o)
+		srv, err := server.New(st, o)
+		if err == nil || !strings.Contains(err.Error(), name) {
+			t.Errorf("%s = -1: err %v, want one naming it", name, err)
+		}
+		if srv != nil {
+			srv.Close()
+		}
+	}
+	srv, err := server.New(st, server.Options{})
+	if err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+	srv.Close()
 }
