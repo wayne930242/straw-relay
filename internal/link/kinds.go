@@ -28,4 +28,5 @@ var Kinds = map[string]KindRule{
 	"notice":          {false, false, SenderUnattended},
 	"caps":            {true, true, SenderAny},
 	"tower-reply":     {false, false, SenderAny},
+	"unit-stop":       {false, false, SenderAttended},
 }
