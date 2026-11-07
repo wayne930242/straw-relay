@@ -120,8 +120,16 @@ type vectors struct {
 			Ephemeral bool   `json:"ephemeral"`
 			WholeTeam bool   `json:"wholeTeam"`
 			Sender    string `json:"sender"`
+			Live      bool   `json:"live"`
 		} `json:"rule"`
 	} `json:"kinds"`
+	OperateCases struct {
+		Structure []struct {
+			Name      string          `json:"name"`
+			Plaintext string          `json:"plaintext"`
+			Expect    json.RawMessage `json:"expect"`
+		} `json:"structure"`
+	} `json:"operateCases"`
 }
 
 func loadVectors(t *testing.T) *vectors {
@@ -409,7 +417,7 @@ func TestEnvelopeShapeVectors(t *testing.T) {
 	}
 	for _, k := range v.Kinds {
 		rule, ok := Kinds[k.Kind]
-		if !ok || rule.Ephemeral != k.Rule.Ephemeral || rule.WholeTeam != k.Rule.WholeTeam || rule.Sender != k.Rule.Sender {
+		if !ok || rule.Ephemeral != k.Rule.Ephemeral || rule.WholeTeam != k.Rule.WholeTeam || rule.Sender != k.Rule.Sender || rule.Live != k.Rule.Live {
 			t.Errorf("kind %s: %+v, want %+v", k.Kind, rule, k.Rule)
 		}
 	}
@@ -529,5 +537,110 @@ func TestTowerCapsReplyPlaintextVectors(t *testing.T) {
 		if err := read(unhex(t, c.Plaintext)); (err != nil) != refused {
 			t.Errorf("%s: structure error %v, refused %v", c.Name, err, refused)
 		}
+	}
+}
+
+// operateStructure reads an operate plaintext the way a client does, up to the ciphertext of a frame (the relay never sees plaintext, so this
+// only proves that the shared vectors are structures the canonical decoder reads, or refuses): enc(version 1, a 16-byte session, a type, a body).
+func operateStructure(b []byte) error {
+	f, err := canon.Dec(b, 4)
+	if err != nil {
+		return err
+	}
+	if v, err := canon.ReadInt(f[0]); err != nil || v != 1 {
+		return fmt.Errorf("an operate message is version 1")
+	}
+	if len(f[1]) != 16 {
+		return fmt.Errorf("a session id is 16 bytes")
+	}
+	body := f[3]
+	switch string(f[2]) {
+	case "open":
+		g, err := canon.Dec(body, 3)
+		if err != nil {
+			return err
+		}
+		if len(g[0]) != 32 {
+			return fmt.Errorf("an ephemeral key is 32 bytes")
+		}
+		if _, err := canon.ReadList(g[1]); err != nil {
+			return err
+		}
+		if want := string(g[2]); want != "team" && want != "box" {
+			return fmt.Errorf("want is team or box")
+		}
+	case "accept":
+		g, err := canon.Dec(body, 4)
+		if err != nil {
+			return err
+		}
+		if len(g[0]) != 32 || len(g[1]) != 32 {
+			return fmt.Errorf("a key and a hash are 32 bytes")
+		}
+		scope, err := canon.Dec(g[2], 2)
+		if err != nil {
+			return err
+		}
+		teams, err := canon.ReadList(scope[0])
+		if err != nil {
+			return err
+		}
+		for _, id := range teams {
+			if len(id) != 16 {
+				return fmt.Errorf("a team id is 16 bytes")
+			}
+		}
+		if _, err := canon.ReadBool(scope[1]); err != nil {
+			return err
+		}
+		limits, err := canon.Dec(g[3], 3)
+		if err != nil {
+			return err
+		}
+		for _, n := range limits {
+			if _, err := canon.ReadInt(n); err != nil {
+				return err
+			}
+		}
+	case "refuse", "close":
+		_, err := canon.Dec(body, 1)
+		return err
+	case "frame":
+		g, err := canon.Dec(body, 2)
+		if err != nil {
+			return err
+		}
+		if n, err := canon.ReadInt(g[0]); err != nil || n < 1 {
+			return fmt.Errorf("a frame counter starts at 1")
+		}
+		if len(g[1]) < 16 || len(g[1]) > 200*1024 {
+			return fmt.Errorf("a frame's ciphertext holds a tag and at most 200 KB")
+		}
+	default:
+		return fmt.Errorf("an operate type this build does not know")
+	}
+	return nil
+}
+
+func TestOperatePlaintextVectors(t *testing.T) {
+	v := loadVectors(t)
+	if len(v.OperateCases.Structure) < 20 {
+		t.Fatalf("only %d operate structure cases", len(v.OperateCases.Structure))
+	}
+	for _, c := range v.OperateCases.Structure {
+		refused := string(c.Expect) == "null"
+		if err := operateStructure(unhex(t, c.Plaintext)); (err != nil) != refused {
+			t.Errorf("%s: structure error %v, refused %v", c.Name, err, refused)
+		}
+	}
+	// The kinds cases hold the operate plaintext too: an open.
+	found := false
+	for _, k := range v.Kinds {
+		if k.Kind == "operate" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the vectors have no operate kind")
 	}
 }

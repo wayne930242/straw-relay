@@ -92,8 +92,11 @@ func (ss *streamSet) add(key string) (*streamHandle, func()) {
 //	envelope  {"id", "from", "ephemeral", "envelope"}        queued envelopes addressed to the device and not yet acked; the last ephemeral
 //	                                                         one of each sender and kind addressed to it or to the whole team
 //	join      {"hash", "request"}                            join requests for the device's invites
+//	live      {"id", "from", "ephemeral": true, "envelope", "dropped"?}
+//	                                                         a live envelope, written now to the streams open now, and never again; `dropped`
+//	                                                         counts the ones this stream's queue threw away before it
 //
-// Each event's `id:` is a number that only grows; Last-Event-ID resumes after it. A comment line keeps the connection alive. A device removed
+// Each stored event's `id:` is a number that only grows; Last-Event-ID resumes after it. A live event has no `id:` line, so it moves nothing. A comment line keeps the connection alive. A device removed
 // from the team is shown the roster entries it has not seen, its own removal included, and the stream ends.
 func (s *Server) events(c *call) error {
 	team, err := c.pathTeam()
@@ -120,6 +123,9 @@ func (s *Server) events(c *call) error {
 		s.log.Error("stream refused: cannot clear the read deadline", "team", c.team, "device", a.device, "err", err)
 		return fail(http.StatusInternalServerError, "stream-unsupported")
 	}
+	// The stream is registered for live envelopes before its headers go out, so one posted after a client sees the stream open is not missed.
+	lq := newLiveQueue(s.opt.LiveQueueEnvelopes, s.opt.LiveQueueBytes)
+	defer s.live.add(c.team, a.device, lq)()
 	w := c.w
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -148,34 +154,64 @@ func (s *Server) events(c *call) error {
 	defer tick.Stop()
 	ctx := c.r.Context()
 
-	first := true
-	for {
+	isMember := func() bool {
 		// The team entry authenticate returned is the live one (roster appends update it in place), so no lookup here can fail and make a
 		// member look removed.
 		_, member := a.entry.current().Members[a.device]
-		events, err := s.st.EventsAfter(team, a.device, cursor, streamPage, first, !member)
-		first = false
-		if err != nil {
-			return c.streamFailed("events query failed", a.device, err)
-		}
-		for _, e := range events {
-			data, err := eventData(e)
+		return member
+	}
+	first, stored := true, true
+	for {
+		if stored {
+			member := isMember()
+			events, err := s.st.EventsAfter(team, a.device, cursor, streamPage, first, !member)
+			first = false
 			if err != nil {
-				return c.streamFailed("event encoding failed", a.device, err)
+				return c.streamFailed("events query failed", a.device, err)
 			}
-			if write("id: %d\nevent: %s\ndata: %s\n\n", e.EID, e.Type, data) != nil {
+			for _, e := range events {
+				data, err := eventData(e)
+				if err != nil {
+					return c.streamFailed("event encoding failed", a.device, err)
+				}
+				if write("id: %d\nevent: %s\ndata: %s\n\n", e.EID, e.Type, data) != nil {
+					return nil
+				}
+				cursor = e.EID
+			}
+			if len(events) == streamPage {
+				continue
+			}
+			if !member {
 				return nil
 			}
-			cursor = e.EID
+			stored = false
 		}
-		if len(events) == streamPage {
-			continue
-		}
-		if !member {
-			return nil
+		// Live envelopes go out between the stored events, with no id line: they never move the cursor. A member that left since the last look
+		// gets none of what was queued; the stored pass above shows it its removal.
+		if !lq.empty() {
+			if s.hookLive != nil {
+				s.hookLive(a.device)
+			}
+			if !isMember() {
+				lq.clear()
+				stored = true
+				continue
+			}
+			for _, o := range lq.take() {
+				data, err := liveData(o)
+				if err != nil {
+					return c.streamFailed("event encoding failed", a.device, err)
+				}
+				if write("event: live\ndata: %s\n\n", data) != nil {
+					return nil
+				}
+			}
 		}
 		select {
 		case <-wake:
+			stored = true
+		case <-lq.wake:
 		case <-tick.C:
 			if write(": keepalive\n\n") != nil {
 				return nil
@@ -188,6 +224,16 @@ func (s *Server) events(c *call) error {
 			return nil
 		}
 	}
+}
+
+// liveData is the data of an `event: live`: the envelope's id and sender, the ephemeral flag the kind fixes, the envelope, and how many envelopes the
+// stream's queue threw away before this one (left out when none).
+func liveData(o liveOut) ([]byte, error) {
+	m := map[string]any{"id": hex.EncodeToString(o.id), "from": o.from, "ephemeral": true, "envelope": b64.EncodeToString(o.body)}
+	if o.dropped > 0 {
+		m["dropped"] = o.dropped
+	}
+	return json.Marshal(m)
 }
 
 func eventData(e store.Event) ([]byte, error) {

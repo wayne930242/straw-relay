@@ -12,21 +12,24 @@ type KindRule struct {
 	Ephemeral bool
 	WholeTeam bool
 	Sender    string
+	// Live marks a kind the relay holds in memory only, for the addressee's open streams now: it is never stored, queued, or replayed.
+	Live bool
 }
 
 // Kinds are the message kinds of the spec (Message kinds), as the reference implementation fixes them.
 var Kinds = map[string]KindRule{
-	"tower":           {false, false, SenderAny},
-	"presence":        {true, true, SenderAny},
-	"board":           {true, true, SenderAny},
-	"confirm-request": {false, false, SenderAny},
-	"confirm-answer":  {false, false, SenderAny},
-	"dialog-open":     {false, false, SenderUnattended},
-	"dialog-answer":   {false, false, SenderAttended},
-	"dialog-close":    {false, false, SenderUnattended},
-	"unit-status":     {true, false, SenderUnattended},
-	"notice":          {false, false, SenderUnattended},
-	"caps":            {true, true, SenderAny},
-	"tower-reply":     {false, false, SenderAny},
-	"unit-stop":       {false, false, SenderAttended},
+	"tower":           {false, false, SenderAny, false},
+	"presence":        {true, true, SenderAny, false},
+	"board":           {true, true, SenderAny, false},
+	"confirm-request": {false, false, SenderAny, false},
+	"confirm-answer":  {false, false, SenderAny, false},
+	"dialog-open":     {false, false, SenderUnattended, false},
+	"dialog-answer":   {false, false, SenderAttended, false},
+	"dialog-close":    {false, false, SenderUnattended, false},
+	"unit-status":     {true, false, SenderUnattended, false},
+	"notice":          {false, false, SenderUnattended, false},
+	"caps":            {true, true, SenderAny, false},
+	"tower-reply":     {false, false, SenderAny, false},
+	"unit-stop":       {false, false, SenderAttended, false},
+	"operate":         {true, false, SenderAny, true},
 }

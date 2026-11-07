@@ -30,6 +30,13 @@ type Options struct {
 	MaxTeamBytes int64
 	// RatePerMinute is the envelopes a team may post in a minute (600).
 	RatePerMinute int
+	// The live class (kinds with link.KindRule.Live) has limits of its own, apart from RatePerMinute: envelopes and bytes a minute for each
+	// (team, sender) (1,200 and 8 MB), envelopes a minute for a team (3,000), and what one stream may hold for its writer (64 envelopes or 4 MB).
+	LiveRatePerSender  int
+	LiveBytesPerSender int64
+	LiveRatePerTeam    int
+	LiveQueueEnvelopes int
+	LiveQueueBytes     int
 	// Retention is how long an unacknowledged envelope is kept (7 days).
 	Retention time.Duration
 	// MaxOpenInvites is the unexpired invites a team may hold (50).
@@ -54,6 +61,21 @@ func (o *Options) defaults() {
 	}
 	if o.RatePerMinute == 0 {
 		o.RatePerMinute = 600
+	}
+	if o.LiveRatePerSender == 0 {
+		o.LiveRatePerSender = 1200
+	}
+	if o.LiveBytesPerSender == 0 {
+		o.LiveBytesPerSender = 8 << 20
+	}
+	if o.LiveRatePerTeam == 0 {
+		o.LiveRatePerTeam = 3000
+	}
+	if o.LiveQueueEnvelopes == 0 {
+		o.LiveQueueEnvelopes = 64
+	}
+	if o.LiveQueueBytes == 0 {
+		o.LiveQueueBytes = 4 << 20
 	}
 	if o.Retention == 0 {
 		o.Retention = 7 * 24 * time.Hour
@@ -80,10 +102,14 @@ type Server struct {
 	// Test hooks (see export_test.go): hookAuth runs right after a request authenticated, hookLoad each time a roster is loaded from the database.
 	hookAuth func(device string)
 	hookLoad func()
+	// hookLive runs in a stream before it writes the live envelopes queued for it.
+	hookLive func(device string)
 
-	hub     hub
-	limiter limiter
-	streams streamSet
+	hub         hub
+	limiter     limiter
+	liveLimiter liveLimiter
+	live        liveHub
+	streams     streamSet
 }
 
 // New makes a Server over a store.
@@ -92,6 +118,9 @@ func New(st *store.Store, o Options) *Server {
 	s := &Server{st: st, opt: o, log: o.Logger, mux: http.NewServeMux(), done: make(chan struct{}), teams: map[string]*teamEntry{}, flights: map[string]*flight{}, missing: map[string]time.Time{}}
 	s.hub.subs = map[string]map[chan struct{}]struct{}{}
 	s.limiter.window = map[string][]int64{}
+	s.liveLimiter.senders = map[string][]liveHit{}
+	s.liveLimiter.teams = map[string][]int64{}
+	s.live.streams = map[string]map[string]map[*liveQueue]struct{}{}
 	s.streams.byDevice = map[string][]*streamHandle{}
 	s.route("GET /healthz", s.healthz)
 	s.route("POST /v1/teams", s.createTeam)
@@ -116,6 +145,7 @@ func (s *Server) now() int64 { return s.opt.Now().UnixMilli() }
 // Sweep drops what has passed its time (envelopes kept past retention, expired invites) and stale rate windows.
 func (s *Server) Sweep() error {
 	s.limiter.prune(s.now())
+	s.liveLimiter.prune(s.now())
 	return s.st.Sweep(s.now())
 }
 
@@ -146,6 +176,10 @@ type call struct {
 	device   string
 	reqBytes int
 	reason   string
+	// For a live envelope: the log line shows how many it was addressed to and how many streams it was written to.
+	live       bool
+	addressees int
+	delivered  int
 }
 
 // apiError is an error the client sees: a status and a short code, plus optional fields.
@@ -200,8 +234,12 @@ func (s *Server) route(pattern string, fn func(*call) error) {
 				status = 200
 			}
 			// Teams, devices, sizes, and status codes only: never a body, a token, or a query string.
-			s.log.Info("request", "method", r.Method, "route", pattern, "team", c.team, "device", c.device, "status", status,
-				"req_bytes", c.reqBytes, "resp_bytes", c.w.bytes, "ms", time.Since(start).Milliseconds(), "reason", c.reason)
+			args := []any{"method", r.Method, "route", pattern, "team", c.team, "device", c.device, "status", status,
+				"req_bytes", c.reqBytes, "resp_bytes", c.w.bytes, "ms", time.Since(start).Milliseconds(), "reason", c.reason}
+			if c.live {
+				args = append(args, "live", true, "addressees", c.addressees, "delivered", c.delivered)
+			}
+			s.log.Info("request", args...)
 		}()
 		if err := fn(c); err != nil {
 			var ae *apiError
