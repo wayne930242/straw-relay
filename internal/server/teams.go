@@ -153,6 +153,9 @@ func (s *Server) postRoster(c *call) error {
 	}
 	// The state moves before streams are woken, so a removed device's stream sees that it is no longer a member.
 	t.state = next
+	if removed != "" {
+		s.live.drop(c.team, removed)
+	}
 	s.hub.notify(c.team)
 	c.writeJSON(http.StatusCreated, map[string]any{"seq": e.Seq, "hash": hex.EncodeToString(e.Hash())})
 	return nil

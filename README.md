@@ -78,6 +78,7 @@ A 429 carries `Retry-After`.
 | `GET …/roster` | none | 200 `{"head": {"seq", "hash"}, "entries": [{"seq", "hash", "entry": b64}]}` | 400 `bad-after` |
 | `POST …/roster` | `{"entry": b64}` | 201 `{"seq", "hash"}` | 403 `not-signer`; 409 `conflict` with `"head": {"seq", "hash"}`; 422 reason with `"seq"` |
 | `POST …/envelopes` | `{"envelope": b64}` | 201 `{"id": hex16, "duplicate": false}`; 200 with `"duplicate": true` for an id already stored, or `"stale": true` for an ephemeral envelope no newer than the kept one | 400 `malformed`; 403 `from-mismatch`; 413 `envelope-too-large` (over 256 KB); 422 header reason or `no-addressee`; 429 `rate-limited`, `team-full` |
+| `POST …/envelopes`, a live kind (`operate`) | `{"envelope": b64}` | 201 `{"id": hex16, "delivered": n}`, n the addressee's open streams it was written to (0 when none is open); never `duplicate` or `stale` | as above; 422 `live-addressee` unless `to` is exactly one member that is not the sender; 429 `rate-limited` from the live limits below (not retried by the client) |
 | `POST …/acks` | `{"ids": [hex16, …]}` (at most 500) | 200 `{"acked": n}` | 400 |
 | `POST /v1/invites` | `{"team": hex16, "h": hex32, "expires": ms}` | 201 `{"expires"}` | 403 `not-attended`; 409 `invite-exists`; 422 `bad-expiry`; 429 `too-many-invites` |
 | `POST /v1/invites/{h}/join` | `{"request": b64}` (at most 4096 bytes decoded) | 202 `{"queued": true}` | 404 `no-invite` (unknown or expired); 409 `invite-used`; 413 |
@@ -87,7 +88,7 @@ and every rule it can check from plaintext holds. A conflict answers with the he
 
 ### Events
 
-`GET /v1/teams/{team}/events` is `text/event-stream`. Every event has an `id:` that only grows (one counter per relay); `Last-Event-ID` resumes
+`GET /v1/teams/{team}/events` is `text/event-stream`. Every stored event has an `id:` that only grows (one counter per relay; a `live` event has none); `Last-Event-ID` resumes
 after it. Without it the stream starts from the beginning: every roster entry, every queued envelope not yet acknowledged, the last ephemeral
 envelope of each sender, kind, and set of addressed members, and any waiting join requests. An ephemeral envelope is kept under the members it
 reaches, not the raw `to` (order, repeats, and ids that are not members do not make a new set); a post to the whole team is a set of its own, and
@@ -102,6 +103,16 @@ comment line goes out every 25 seconds.
 | `roster` | `{"seq", "hash", "entry": b64}` | every member |
 | `envelope` | `{"id": hex16, "from": deviceId, "ephemeral": bool, "envelope": b64}` | the addressees; for an ephemeral envelope addressed to the whole team, every member but the sender |
 | `join` | `{"hash": hex32, "request": b64}` | the inviter |
+| `live` | `{"id": hex16, "from": deviceId, "ephemeral": true, "envelope": b64, "dropped"?: n}`, with **no `id:` line** | the one addressee, on each of its streams open now |
+
+**Live kinds.** A kind with the `live` rule (today `operate`: ephemeral, one addressee, any sender) is a third class beside queued and ephemeral.
+The relay holds the envelope in memory only, writes it to the addressee's streams that are open at that moment, and forgets it: it is never
+written to SQLite, never counted against the 50 MB, never replayed on a new or resumed stream, and never acknowledged. Its `live` event has no
+`id:` line, so `Last-Event-ID` never moves. Each stream has a queue for its writer of 64 envelopes or 4 MB; a full queue drops its oldest, and the
+next envelope the stream writes carries `dropped: n` (the count thrown away before it) as a hint to resync. Queues also share two byte
+budgets, 16 MB for each team and 64 MB for the relay (`Options.LiveTeamBytes`, `LiveRelayBytes`): over either, the oldest envelope of the largest
+queue under that budget is dropped and counted in that stream's `dropped`, so slow readers cannot grow the relay's memory without bound. Envelopes
+of one sender to one addressee keep their arrival order. Removing a member drops what was queued for it and ends its streams, as for the other kinds.
 
 Queued envelopes stay until the device acknowledges them (`POST …/acks`), whether or not it saw them on a stream, and are dropped after
 7 days. Each sender posts its queued envelopes one at a time, in `seq` order, retrying one until it is accepted before posting the next; the
@@ -119,7 +130,9 @@ A device may hold up to 4 streams; opening a fifth ends the oldest.
   and signed it, the kind is one that sender's `attended` flag allows, the epoch (current, or the previous one when the sender's roster head
   predates the rotation), whole-team only for kinds that allow it, `seq` is 0 for ephemeral kinds and at least 1 for queued ones, the
   roster head exists, `ts` is at most 10 minutes ahead and at most 7 days back. The envelope's `from` has to be the caller.
-- **Caps per team**: 50 MB stored, 256 KB per envelope, 600 envelopes a minute; over the storage or rate cap the answer is 429, over the envelope size 413. Open invites: 50 per team.
+- **Live kinds**: the checks above, with exactly one addressee, a member and not the sender (else 422), and no store-based staleness or replacement.
+- **Caps per team**: 50 MB stored, 256 KB per envelope, 600 queued or ephemeral envelopes a minute; over the storage or rate cap the answer is 429, over the envelope size 413. Open invites: 50 per team.
+- **Live limits**, decided after the envelope is decoded and apart from the 600 a minute: 1,200 envelopes and 8 MB a minute for each (team, sender), and 3,000 envelopes a minute for a team; over them the answer is 429 `rate-limited`. Queued live memory is bounded at 64 envelopes or 4 MB for a stream, 16 MB for a team, and 64 MB for the relay, dropping the oldest as above; a negative limit in `Options` stops `server.New` with an error.
 
 What a receiver decides from its own state stays with the receivers: whether an envelope is addressed to it, the `seq` and `ts` guards, the
 team key and the ciphertext, sealed keys and label tables in roster entries.

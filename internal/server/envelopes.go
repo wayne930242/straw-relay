@@ -45,6 +45,22 @@ func (l *limiter) prune(now int64) {
 	}
 }
 
+// deliverLive writes a live envelope to the open streams of its one addressee, a member that is not the sender, and answers how many streams that
+// was. It stores nothing, so there is no duplicate and no stale: a post that reaches nobody is still a 201 with `delivered: 0`. The caller holds the
+// team's lock, so a removal either lands first (the addressee is no longer a member here) or after the envelope was queued (and drops it).
+func (s *Server) deliverLive(c *call, sender string, state *link.State, env *link.Envelope, raw []byte) error {
+	h := &env.Header
+	if len(h.To) != 1 || h.To[0] == sender {
+		return fail(http.StatusUnprocessableEntity, "live-addressee")
+	}
+	if _, member := state.Members[h.To[0]]; !member {
+		return fail(http.StatusUnprocessableEntity, "live-addressee")
+	}
+	c.delivered = s.live.deliver(c.team, h.To[0], liveItem{id: h.ID, from: h.From, body: raw})
+	c.writeJSON(http.StatusCreated, map[string]any{"id": hex.EncodeToString(h.ID), "delivered": c.delivered})
+	return nil
+}
+
 // postEnvelope: POST /v1/teams/{team}/envelopes {envelope}. The relay checks what plaintext decides (see link.CheckEnvelope), that the sender is
 // the signer of the request, and the caps, then stores the envelope for its addressees (queued) or as the last of its sender and kind
 // (ephemeral, never queued).
@@ -63,19 +79,33 @@ func (s *Server) postEnvelope(c *call) error {
 	if err != nil {
 		return err
 	}
-	if !s.limiter.allow(c.team, s.now(), s.opt.RatePerMinute) {
+	// The envelope is decoded before the rate limit is chosen: a live kind spends the live limiter and none of the queued budget; everything
+	// else, a malformed or oversized post included, spends the queued budget as before. The decode errors are returned after the limit.
+	envRaw, encErr := decode64(in.Envelope)
+	var env *link.Envelope
+	var decErr error
+	if encErr == nil {
+		if len(envRaw) > s.opt.MaxEnvelope {
+			decErr = fail(http.StatusRequestEntityTooLarge, "envelope-too-large")
+		} else if e, derr := link.DecodeEnvelope(envRaw); derr != nil {
+			decErr = fail(http.StatusBadRequest, "malformed")
+		} else {
+			env = e
+		}
+	}
+	if env != nil && link.Kinds[env.Header.Kind].Live {
+		c.live, c.addressees = true, len(env.Header.To)
+		if !s.liveLimiter.allow(c.team, a.device, int64(len(envRaw)), s.now(), s.opt.LiveRatePerSender, s.opt.LiveBytesPerSender, s.opt.LiveRatePerTeam) {
+			return fail(http.StatusTooManyRequests, "rate-limited")
+		}
+	} else if !s.limiter.allow(c.team, s.now(), s.opt.RatePerMinute) {
 		return fail(http.StatusTooManyRequests, "rate-limited")
 	}
-	envRaw, err := decode64(in.Envelope)
-	if err != nil {
-		return err
+	if encErr != nil {
+		return encErr
 	}
-	if len(envRaw) > s.opt.MaxEnvelope {
-		return fail(http.StatusRequestEntityTooLarge, "envelope-too-large")
-	}
-	env, derr := link.DecodeEnvelope(envRaw)
-	if derr != nil {
-		return fail(http.StatusBadRequest, "malformed")
+	if decErr != nil {
+		return decErr
 	}
 	h := &env.Header
 	if h.From != a.device {
@@ -92,6 +122,9 @@ func (s *Server) postEnvelope(c *call) error {
 	}
 	if reason := link.CheckEnvelope(team, state, env, s.now()); reason != "" {
 		return fail(http.StatusUnprocessableEntity, reason)
+	}
+	if link.Kinds[h.Kind].Live {
+		return s.deliverLive(c, a.device, state, env, envRaw)
 	}
 	// The addressees: the named members, or every member for the whole team; never the sender itself.
 	var recipients []string

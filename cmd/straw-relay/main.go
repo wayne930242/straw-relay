@@ -188,7 +188,10 @@ func serve(args []string, stderr io.Writer) error {
 		}
 	}()
 
-	srv := server.New(st, server.Options{Logger: log})
+	srv, err := server.New(st, server.Options{Logger: log})
+	if err != nil {
+		return err
+	}
 	httpSrv := server.NewHTTPServer(*addr, srv.Handler(), server.Timeouts{})
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

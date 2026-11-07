@@ -84,7 +84,10 @@ func newHarnessAt(t *testing.T, path string, mod ...func(*server.Options)) *harn
 	for _, m := range mod {
 		m(&o)
 	}
-	h.srv = server.New(st, o)
+	h.srv, err = server.New(st, o)
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.http = httptest.NewServer(h.srv.Handler())
 	t.Cleanup(func() {
 		h.srv.Close()
