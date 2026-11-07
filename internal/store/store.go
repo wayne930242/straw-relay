@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_team ON events (team, eid);
 CREATE UNIQUE INDEX IF NOT EXISTS events_envelope_ref ON events (team, ref) WHERE typ = 'envelope';
-CREATE INDEX IF NOT EXISTS events_ephemeral ON events (team, sender, kind) WHERE ephemeral = 1;
+DROP INDEX IF EXISTS events_ephemeral;
+CREATE INDEX IF NOT EXISTS events_ephemeral_to ON events (team, sender, kind, addressed) WHERE ephemeral = 1;
 CREATE INDEX IF NOT EXISTS events_expiry ON events (expires_at) WHERE expires_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS deliveries (eid INTEGER NOT NULL REFERENCES events (eid) ON DELETE CASCADE, device TEXT NOT NULL, PRIMARY KEY (eid, device)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS deliveries_device ON deliveries (device);
@@ -335,12 +336,12 @@ type Envelope struct {
 type PutResult struct {
 	// Duplicate: the envelope id was already stored.
 	Duplicate bool
-	// Stale: an ephemeral envelope no newer than the one kept for its sender and kind.
+	// Stale: an ephemeral envelope no newer than the one kept for its sender, kind and addressees.
 	Stale bool
 }
 
 // PutEnvelope stores an envelope. A queued one gets a pending delivery for each of recipients; an ephemeral one replaces the last of its
-// sender and kind and is never queued. It counts against maxBytes of stored envelope bytes in the team (ErrFull).
+// sender, kind and addressees (the whole team being one addressee set of its own) and is never queued. It counts against maxBytes of stored envelope bytes in the team (ErrFull).
 func (s *Store) PutEnvelope(team []byte, e Envelope, recipients []string, expires, maxBytes int64) (PutResult, error) {
 	var res PutResult
 	err := s.tx(func(t *sql.Tx) error {
@@ -353,9 +354,10 @@ func (s *Store) PutEnvelope(team []byte, e Envelope, recipients []string, expire
 			return nil
 		}
 		var replaced, replacedSize int64
+		to, _ := json.Marshal(append([]string{}, e.Addressed...))
 		if e.Ephemeral {
 			var oldTS int64
-			err := t.QueryRow(`SELECT eid, ts, size FROM events WHERE team = ? AND typ = 'envelope' AND ephemeral = 1 AND sender = ? AND kind = ?`, team, e.Sender, e.Kind).Scan(&replaced, &oldTS, &replacedSize)
+			err := t.QueryRow(`SELECT eid, ts, size FROM events WHERE team = ? AND typ = 'envelope' AND ephemeral = 1 AND sender = ? AND kind = ? AND addressed = ?`, team, e.Sender, e.Kind, string(to)).Scan(&replaced, &oldTS, &replacedSize)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
@@ -376,7 +378,6 @@ func (s *Store) PutEnvelope(team []byte, e Envelope, recipients []string, expire
 				return err
 			}
 		}
-		to, _ := json.Marshal(append([]string{}, e.Addressed...))
 		r, err := t.Exec(`INSERT INTO events (team, typ, ref, sender, kind, ephemeral, addressed, body, size, ts, expires_at) VALUES (?, 'envelope', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			team, e.ID, e.Sender, e.Kind, e.Ephemeral, string(to), e.Body, len(e.Body), e.TS, expires)
 		if err != nil {
@@ -459,7 +460,7 @@ type Event struct {
 }
 
 // EventsAfter returns the events with eid greater than after that a device may see, oldest first: every roster entry, the queued envelopes
-// addressed to it and not yet acknowledged, the last ephemeral envelope of each sender and kind addressed to it (or to the whole team), and
+// addressed to it and not yet acknowledged, the last ephemeral envelope of each sender, kind and addressee set that includes it (or the whole team), and
 // the join requests of its invites. With replayQueued (the first page of a stream), every queued envelope still pending for the device is
 // returned whatever `after` says: a device that resumed past one it never acknowledged (a crash before delivery) must not lose it. With
 // onlyRoster, only roster entries (what a removed device is still shown).
