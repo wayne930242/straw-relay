@@ -13,6 +13,7 @@ import (
 	"math"
 	"net/url"
 	"os"
+	"slices"
 
 	_ "modernc.org/sqlite"
 )
@@ -57,7 +58,8 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_team ON events (team, eid);
 CREATE UNIQUE INDEX IF NOT EXISTS events_envelope_ref ON events (team, ref) WHERE typ = 'envelope';
-CREATE INDEX IF NOT EXISTS events_ephemeral ON events (team, sender, kind) WHERE ephemeral = 1;
+DROP INDEX IF EXISTS events_ephemeral;
+CREATE INDEX IF NOT EXISTS events_ephemeral_to ON events (team, sender, kind, addressed) WHERE ephemeral = 1;
 CREATE INDEX IF NOT EXISTS events_expiry ON events (expires_at) WHERE expires_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS deliveries (eid INTEGER NOT NULL REFERENCES events (eid) ON DELETE CASCADE, device TEXT NOT NULL, PRIMARY KEY (eid, device)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS deliveries_device ON deliveries (device);
@@ -313,8 +315,75 @@ func (s *Store) AppendRoster(team []byte, seq int64, hash, entry []byte, removed
 				return err
 			}
 		}
-		return nil
+		return dropEphemeralAddressee(t, team, removed)
 	})
+}
+
+// dropEphemeralAddressee takes a removed device out of the ephemeral envelopes addressed to it: a row for it alone is deleted, and a row for it and
+// others is rewritten without it, under the key of the smaller set (where that key is already held, the newer of the two stays).
+func dropEphemeralAddressee(t *sql.Tx, team []byte, removed string) error {
+	type row struct {
+		eid, ts   int64
+		sender    string
+		kind      string
+		addressed []string
+	}
+	rows, err := t.Query(`SELECT eid, ts, sender, kind, addressed FROM events WHERE team = ? AND typ = 'envelope' AND ephemeral = 1 AND instr(addressed, ?) > 0`, team, `"`+removed+`"`)
+	if err != nil {
+		return err
+	}
+	var hit []row
+	for rows.Next() {
+		var r row
+		var raw string
+		if err := rows.Scan(&r.eid, &r.ts, &r.sender, &r.kind, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := json.Unmarshal([]byte(raw), &r.addressed); err != nil {
+			rows.Close()
+			return fmt.Errorf("event %d: addressed %q: %w", r.eid, raw, err)
+		}
+		hit = append(hit, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, r := range hit {
+		rest := slices.DeleteFunc(r.addressed, func(id string) bool { return id == removed })
+		if len(rest) == len(r.addressed) { // the id was only a substring of another
+			continue
+		}
+		if len(rest) == 0 {
+			if _, err := t.Exec(`DELETE FROM events WHERE eid = ?`, r.eid); err != nil {
+				return err
+			}
+			continue
+		}
+		key := canonicalAddressed(rest)
+		var other, otherTS int64
+		err := t.QueryRow(`SELECT eid, ts FROM events WHERE team = ? AND typ = 'envelope' AND ephemeral = 1 AND sender = ? AND kind = ? AND addressed = ?`, team, r.sender, r.kind, key).Scan(&other, &otherTS)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return err
+		case otherTS >= r.ts:
+			if _, err := t.Exec(`DELETE FROM events WHERE eid = ?`, r.eid); err != nil {
+				return err
+			}
+			continue
+		default:
+			if _, err := t.Exec(`DELETE FROM events WHERE eid = ?`, other); err != nil {
+				return err
+			}
+		}
+		if _, err := t.Exec(`UPDATE events SET addressed = ? WHERE eid = ?`, key, r.eid); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---- Envelopes -----------------------------------------------------------------------------------------------------------------------
@@ -325,22 +394,27 @@ type Envelope struct {
 	Sender    string
 	Kind      string
 	Ephemeral bool
-	// Addressed is the header's `to`; empty means the whole team (ephemeral kinds only are read through it).
+	// Addressed is the members the envelope is delivered to; empty means the whole team (ephemeral kinds only are read through it). Order and
+	// repeats do not matter: the store keeps it sorted and de-duplicated, which is also the key an ephemeral envelope is replaced under.
 	Addressed []string
 	Body      []byte
 	TS        int64
+	// MaxKeys bounds the ephemeral rows one sender holds of one kind (the whole team being one key): a new key beyond it evicts the oldest row.
+	// Zero means no bound.
+	MaxKeys int
 }
 
 // PutResult says what PutEnvelope did.
 type PutResult struct {
 	// Duplicate: the envelope id was already stored.
 	Duplicate bool
-	// Stale: an ephemeral envelope no newer than the one kept for its sender and kind.
+	// Stale: an ephemeral envelope no newer than the one kept for its sender, kind and addressees.
 	Stale bool
 }
 
 // PutEnvelope stores an envelope. A queued one gets a pending delivery for each of recipients; an ephemeral one replaces the last of its
-// sender and kind and is never queued. It counts against maxBytes of stored envelope bytes in the team (ErrFull).
+// sender, kind and addressees (the whole team being one addressee set of its own) and is never queued; a sender's rows of one kind never
+// exceed e.MaxKeys, the oldest being evicted. It counts against maxBytes of stored envelope bytes in the team (ErrFull).
 func (s *Store) PutEnvelope(team []byte, e Envelope, recipients []string, expires, maxBytes int64) (PutResult, error) {
 	var res PutResult
 	err := s.tx(func(t *sql.Tx) error {
@@ -353,15 +427,43 @@ func (s *Store) PutEnvelope(team []byte, e Envelope, recipients []string, expire
 			return nil
 		}
 		var replaced, replacedSize int64
+		to := canonicalAddressed(e.Addressed)
+		var evict []int64
 		if e.Ephemeral {
 			var oldTS int64
-			err := t.QueryRow(`SELECT eid, ts, size FROM events WHERE team = ? AND typ = 'envelope' AND ephemeral = 1 AND sender = ? AND kind = ?`, team, e.Sender, e.Kind).Scan(&replaced, &oldTS, &replacedSize)
+			err := t.QueryRow(`SELECT eid, ts, size FROM events WHERE team = ? AND typ = 'envelope' AND ephemeral = 1 AND sender = ? AND kind = ? AND addressed = ?`, team, e.Sender, e.Kind, to).Scan(&replaced, &oldTS, &replacedSize)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
 			if err == nil && oldTS >= e.TS {
 				res.Stale = true
 				return nil
+			}
+			if replaced == 0 && e.MaxKeys > 0 {
+				// A new key: make room for it among the sender's rows of this kind, oldest first.
+				rows, err := t.Query(`SELECT eid, size FROM events WHERE team = ? AND typ = 'envelope' AND ephemeral = 1 AND sender = ? AND kind = ? ORDER BY eid`, team, e.Sender, e.Kind)
+				if err != nil {
+					return err
+				}
+				type row struct{ eid, size int64 }
+				var held []row
+				for rows.Next() {
+					var r row
+					if err := rows.Scan(&r.eid, &r.size); err != nil {
+						rows.Close()
+						return err
+					}
+					held = append(held, r)
+				}
+				if err := rows.Err(); err != nil {
+					rows.Close()
+					return err
+				}
+				rows.Close()
+				for _, r := range held[:max(0, len(held)-e.MaxKeys+1)] {
+					evict = append(evict, r.eid)
+					replacedSize += r.size
+				}
 			}
 		}
 		var stored int64
@@ -372,13 +474,15 @@ func (s *Store) PutEnvelope(team []byte, e Envelope, recipients []string, expire
 			return ErrFull
 		}
 		if replaced != 0 {
-			if _, err := t.Exec(`DELETE FROM events WHERE eid = ?`, replaced); err != nil {
+			evict = append(evict, replaced)
+		}
+		for _, eid := range evict {
+			if _, err := t.Exec(`DELETE FROM events WHERE eid = ?`, eid); err != nil {
 				return err
 			}
 		}
-		to, _ := json.Marshal(append([]string{}, e.Addressed...))
 		r, err := t.Exec(`INSERT INTO events (team, typ, ref, sender, kind, ephemeral, addressed, body, size, ts, expires_at) VALUES (?, 'envelope', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			team, e.ID, e.Sender, e.Kind, e.Ephemeral, string(to), e.Body, len(e.Body), e.TS, expires)
+			team, e.ID, e.Sender, e.Kind, e.Ephemeral, to, e.Body, len(e.Body), e.TS, expires)
 		if err != nil {
 			return err
 		}
@@ -396,6 +500,18 @@ func (s *Store) PutEnvelope(team []byte, e Envelope, recipients []string, expire
 		return nil
 	})
 	return res, err
+}
+
+// canonicalAddressed is the stored form of an addressee list: a JSON array, sorted and without repeats; "[]" for the whole team.
+func canonicalAddressed(ids []string) string {
+	list := slices.Clone(ids)
+	slices.Sort(list)
+	list = slices.Compact(list)
+	if list == nil {
+		list = []string{}
+	}
+	b, _ := json.Marshal(list)
+	return string(b)
 }
 
 // Ack marks envelopes read by a device and drops those every addressee has read. It returns how many pending deliveries it cleared.
@@ -459,7 +575,7 @@ type Event struct {
 }
 
 // EventsAfter returns the events with eid greater than after that a device may see, oldest first: every roster entry, the queued envelopes
-// addressed to it and not yet acknowledged, the last ephemeral envelope of each sender and kind addressed to it (or to the whole team), and
+// addressed to it and not yet acknowledged, the last ephemeral envelope of each sender, kind and addressee set that includes it (or the whole team), and
 // the join requests of its invites. With replayQueued (the first page of a stream), every queued envelope still pending for the device is
 // returned whatever `after` says: a device that resumed past one it never acknowledged (a crash before delivery) must not lose it. With
 // onlyRoster, only roster entries (what a removed device is still shown).
