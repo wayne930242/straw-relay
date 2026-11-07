@@ -116,7 +116,13 @@ func (s *Server) postEnvelope(c *call) error {
 	if len(recipients) == 0 && !h.Ephemeral {
 		return fail(http.StatusUnprocessableEntity, "no-addressee")
 	}
-	res, err := s.st.PutEnvelope(team, store.Envelope{ID: h.ID, Sender: h.From, Kind: h.Kind, Ephemeral: h.Ephemeral, Addressed: h.To, Body: envRaw, TS: h.TS},
+	// An ephemeral envelope is kept under the members it reaches (the whole team stays empty), so a list that differs only in order, repeats, or
+	// ids that are not members is the same key; a sender holds at most one row per member and one for the whole team.
+	var addressed []string
+	if len(h.To) > 0 {
+		addressed = recipients
+	}
+	res, err := s.st.PutEnvelope(team, store.Envelope{ID: h.ID, Sender: h.From, Kind: h.Kind, Ephemeral: h.Ephemeral, Addressed: addressed, Body: envRaw, TS: h.TS, MaxKeys: len(state.Members) + 1},
 		recipients, s.now()+s.opt.Retention.Milliseconds(), s.opt.MaxTeamBytes)
 	switch {
 	case errors.Is(err, store.ErrFull):
